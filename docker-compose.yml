@@ -1,15 +1,14 @@
-version: "3.8"
-
+version: "3.9"
 services:
   mysql:
     image: mysql:8.0
     container_name: iot-mysql
     restart: unless-stopped
     environment:
-      MYSQL_ROOT_PASSWORD: root
-      MYSQL_DATABASE: iot
+      MYSQL_ROOT_PASSWORD: "123456"
+      MYSQL_DATABASE: iot_gateway
     ports:
-      - "3306:3306"
+      - "3307:3306"
     volumes:
       - mysql_data:/var/lib/mysql
       - ./migrations:/docker-entrypoint-initdb.d
@@ -32,6 +31,17 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+  emqx:
+    image: emqx:5
+    container_name: iot-emqx
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+      - "18083:18083"
+    environment:
+      EMQX_DASHBOARD__DEFAULT_USERNAME: admin
+      EMQX_DASHBOARD__DEFAULT_PASSWORD: public
 
 volumes:
   mysql_data:

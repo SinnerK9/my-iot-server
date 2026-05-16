@@ -18,7 +18,7 @@ func Load() *Config {
 	return &Config{
 		Port:   getenv("PORT", "7777"), //结构体变量的赋值应该用冒号
 		DBHost: getenv("DB_HOST", "127.0.0.1"),
-		DBPort: getenv("DB_PORT", "3306"),
+		DBPort: getenv("DB_PORT", "3307"),
 		DBUser: getenv("DB_USER", "root"),
 		DBPass: getenv("DB_PASS", "123456"),
 		DBName: getenv("DB_NAME", "iot_gateway"),
