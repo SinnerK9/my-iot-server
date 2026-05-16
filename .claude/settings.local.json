@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd *)",
+      "PowerShell(go build *)",
+      "Bash(/usr/local/go/bin/go version *)",
+      "Bash(wsl go *)"
+    ]
+  }
+}

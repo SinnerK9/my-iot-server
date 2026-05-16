@@ -16,21 +16,12 @@ type Config struct {
 func Load() *Config {
 	//Go中允许直接返回局部变量的指针，发现返回指针则将其分配在堆上
 	return &Config{
-<<<<<<< HEAD
 		Port:   getenv("PORT", "7777"), //结构体变量的赋值应该用冒号
 		DBHost: getenv("DB_HOST", "127.0.0.1"),
 		DBPort: getenv("DB_PORT", "3306"),
 		DBUser: getenv("DB_USER", "root"),
 		DBPass: getenv("DB_PASS", "123456"),
 		DBName: getenv("DB_NAME", "iot_gateway"),
-=======
-		Port:   getenv("PORT", "7777"),
-		DBHost: getenv("DB_HOST", "127.0.0.1"),
-		DBPort.getenv("DB_PORT", "3306"),
-		DBUser.getenv("DB_USER", "root"),
-		DBPass.getenv("DB_PASS", "123456"),
-		DBName.getenv("DB_NAME", "iot_gateway"),
->>>>>>> 212003b790a24a3b77f52152290cf6322755cac1
 	}
 }
 
