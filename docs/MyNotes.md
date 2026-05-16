@@ -94,7 +94,6 @@
   });
 
   Go 不需要线程池：
-
   // Go handler 里：
   go func() {
       // 任何 CPU 密集操作直接 go，不需要线程池
@@ -148,4 +147,144 @@
   ├───────────────────────────────────────────┼───────────────────────────────────────────────────────────────────┤
   │ srv.Shutdown(ctx)                         │ stop() + ThreadPool::~ThreadPool() 里的 while(pending>0) sleep    │
   ├───────────────────────────────────────────┼───────────────────────────────────────────────────────────────────┤
-  │ defer stop() / defer cancel()             │ RAII: ~Epoller() 里的 close(epoll_fd_)     
+  │ defer stop() / defer cancel()             │ RAII: ~Epoller() 里的 close(epoll_fd_)
+
+
+---
+
+## Week 1 Day 2：配置管理 + Docker 基础设施
+
+### 一、Config 包：环境变量 → struct 映射
+
+新建 `internal/config/config.go`，修改 `cmd/server/main.go` 用 `config.Load()` 替代硬编码。
+
+#### 公开 vs 私有——首字母大小写决定
+
+```go
+type Config struct {  // 大写 C → 导出类型，外部包可用
+    Port   string     // 大写 P → 导出字段
+}
+func Load() *Config { ... }  // 大写 L → 导出函数
+func getenv(key, def string) string { ... }  // 小写 g → 包内私有
+```
+
+C++ 里你写 `public:` / `private:`，Go 没有这两个关键字。**首字母大小写决定可见性**。
+
+#### 这个语法坑了我：struct 字面量用冒号不是点
+
+```go
+// ✅ 正确：冒号
+Port:   getenv("PORT", "8080"),
+
+// ❌ 错误：点 —— 这是 C++ 调方法的习惯
+Port.getenv("PORT", "8080"),
+```
+
+Go 里点号只用于调方法/访问实例字段，struct 字面量赋值用冒号。
+
+#### 返回局部变量指针——Go 可以，C++ 不行
+
+```go
+func Load() *Config {
+    return &Config{...}  // C++ 里这是未定义行为，Go 里编译器自动逃逸分析分配到堆上
+}
+```
+
+#### import 路径必须从 go.mod 的 module 名开始
+
+```go
+// ❌ Go module 禁用相对 import
+import "../../internal/config"
+
+// ✅ 必须用模块全路径
+import "github.com/SinnerK9/my-iot-server/internal/config"
+```
+
+---
+
+### 二、docker-compose.yml：基础设施即代码
+
+github.com/SinnerK9/my-iot-server/internal/config
+
+#### 它解决什么问题
+
+C++ webserver 开发时 MySQL 是手动 `apt install` 装系统上的。换机器得重装。docker-compose 把基础设施变成一个配置文件，`docker compose up -d` 一行全起。
+
+#### 文件结构三层
+
+```
+version          ← 语法版本
+services:        ← 你要跑的几个容器
+  mysql:         ←   数据库
+  redis:         ←   缓存
+  emqx:          ←   消息中间件
+volumes:         ← 声明持久化卷
+```
+
+#### 每个 service 回答六个问题
+
+| 字段 | 解决的问题 | MySQL 例子 | Redis 例子 |
+|---|---|---|---|
+| `image` | 镜像从哪来？ | `mysql:8.0` | `redis:7-alpine`（5MB 精简 Linux） |
+| `container_name` | 容器叫什么？ | `iot-mysql`（方便 `docker logs iot-mysql`） | `iot-redis` |
+| `restart` | 挂了怎么办？ | `unless-stopped`（crash 自动拉起，手动 stop 尊重你） | 同 |
+| `ports` | 怎么和外界通信？ | `"3307:3306"`（宿主机:容器内） | `"6379:6379"` |
+| `volumes` | 数据存哪？ | 命名卷 + migrations 自动建表 | `redis_data:/data` |
+| `healthcheck` | 怎么确认就绪？ | `mysqladmin ping` 每 5s 测 | `redis-cli ping` |
+
+#### 端口映射：为什么用 3307
+
+系统已有 MySQL（C++ webserver 时期装的）占着 3306。Docker 用 3307 映射：
+
+```
+C++ WebServer  →  127.0.0.1:3306  (系统 mysqld，不动)
+Go 项目        →  127.0.0.1:3307  (Docker MySQL，容器内仍是 3306)
+```
+
+#### volumes 两种挂载
+
+- `mysql_data:/var/lib/mysql` — 数据持久化，容器删了表还在（对应 C++ MySQL 的 datadir）
+- `./migrations:/docker-entrypoint-initdb.d` — 容器第一次启动自动执行目录下所有 `.sql` 文件
+
+#### healthcheck：轮询等待机制
+
+MySQL 容器"起来"≠ 进程能接 SQL（有 10-30s 初始化）。healthcheck 让 Docker 替你做轮询：
+
+```cpp
+// 对应你 C++ 代码里手动写的重试逻辑：
+while (retry < 10) { if (mysql_real_connect(...)) break; sleep(5); }
+```
+
+healthcheck 把这段逻辑从代码层移到了基础设施层。
+
+#### EMQX — MQTT Broker
+
+IoT 设备通信的标准协议。你智能家居里"打开灯"指令走 MQTT：
+
+```
+Go Server → MQTT Publish("device/light/cmd", "turn_on") → EMQX → 灯收到指令
+```
+
+Week 3 才用，现在提前跑着。
+
+---
+
+### 三、config.go 和 docker-compose 的对齐
+
+| config.go 默认值 | docker-compose 对应 | 含义 |
+|---|---|---|
+| `DBHost: "127.0.0.1"` | （隐式） | Go 连宿主机 |
+| `DBPort: "3307"` | `ports: "3307:3306"` | 宿主机 3307→容器 3306 |
+| `DBUser: "root"` | MySQL 默认 | root 用户 |
+| `DBPass: "123456"` | `MYSQL_ROOT_PASSWORD: "123456"` | 必须一致 |
+| `DBName: "iot_gateway"` | `MYSQL_DATABASE: iot_gateway` | 自动创建 |
+
+---
+
+### 四、今天踩的坑
+
+1. Go module 不能用相对 import，必须从 go.mod 的 module 名开始
+2. struct 字面量赋值用冒号不是点——C++ 调方法的肌肉记忆
+3. config.go 密码默认值要和 docker-compose 一致
+4. 宿主机 3306 被系统 MySQL 占，改 3307，C++ 项目照旧用 3306
+5. Docker Desktop 需在 Settings→Resources→WSL Integration 打开 Ubuntu-22.04
