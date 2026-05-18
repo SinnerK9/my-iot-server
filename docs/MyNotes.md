@@ -288,3 +288,269 @@ Week 3 才用，现在提前跑着。
 3. config.go 密码默认值要和 docker-compose 一致
 4. 宿主机 3306 被系统 MySQL 占，改 3307，C++ 项目照旧用 3306
 5. Docker Desktop 需在 Settings→Resources→WSL Integration 打开 Ubuntu-22.04
+
+---
+
+## Week 1 Day 3：数据库迁移 + sqlx 接入 + 分层架构
+
+### 一、核心工程思想：Migrations（数据库迁移）为什么不是代码里建表
+
+#### C++ 做法（你在 WebServer 里做的）
+
+```cpp
+// main.cpp 或 init 函数里：
+MYSQL* conn = mysql_real_connect(...);
+const char* sql = "CREATE TABLE IF NOT EXISTS users (id INT AUTO_INCREMENT PRIMARY KEY, ...)";
+mysql_real_query(conn, sql, strlen(sql));
+```
+
+问题：**CREATE TABLE IF NOT EXISTS 永远不会帮你加新字段**。
+
+明天你要给 users 表加一个 `avatar` 字段。你改代码里的 CREATE TABLE 字符串，重启程序——MySQL 一看"表已经存在了"，跳过，什么都不做。你只能手动 `mysql -u root -p` 进去敲 `ALTER TABLE`。换一台机器、换一个同事——他不知道你手动改了什么。
+
+#### 工程化做法：Migrations
+
+```
+migrations/
+├── 001_init.sql            ← 建 users + devices 表
+├── 002_add_avatar.sql      ← ALTER TABLE users ADD COLUMN avatar VARCHAR(255)
+└── 003_add_refresh_token.sql ← 以后再迁移
+```
+
+核心思想：
+
+1. **每个数据库变更是一个新文件**，不改已有文件。文件名带序号，按顺序执行。
+2. **每次变更都是增量**。001 是建表，002 是加列，003 是建索引——永远不会 "修改 001 然后重新跑"。
+3. Git 版本控制能 diff 出来——"周三关梓浩加了个 avatar 字段，看 002_add_avatar.sql"。
+4. 新环境 `docker compose up -d` 时，MySQL 容器的 `docker-entrypoint-initdb.d` 机制按文件名顺序执行所有 `.sql` 文件，得到完全一致的数据库结构。
+
+#### 为什么这很重要（面试金句）
+
+> "数据库 schema 和代码一样，必须受版本控制。Migrations 是数据库变更的唯一执行通道，它保证了所有环境（开发/测试/生产）的结构一致性。代码回滚时，你能精确知道数据库处于哪个 schema 版本。"
+
+| 维度 | C++ WebServer | 这个 Go 项目 |
+|---|---|---|
+| 建表位置 | 代码里 `mysql_real_query("CREATE TABLE...")` | 独立的 `migrations/` SQL 文件 |
+| 加新字段 | 手动连 MySQL 敲 ALTER，或改代码但重启不生效 | 新建 `002_xxx.sql`，跑一下就生效 |
+| 数据库版本 | 没有版本概念——不知道现在是什么状态 | 文件名就是版本——`001` → `002` → `003` |
+| 团队协作 | 本地改了，同事不知道，上线炸 | 所有环境跑同一批 migrations |
+| 历史追溯 | 不知道是谁、什么时候、为什么改了表结构 | Git log 看 migrations 文件变更 |
+
+---
+
+### 二、MySQL 在这个 IoT 项目里存什么
+
+四种核心数据：
+
+| 表 | 内容 | 为什么需要 |
+|---|---|---|
+| `users` | 用户账号、密码 bcrypt hash | 注册/登录/JWT 鉴权 |
+| `devices` | 设备 ID、归属用户、类型、在线状态 | "这个用户的设备列表"、"这个设备是你的才能控制" |
+| `conversations` | 一次语音对话会话 | 查看历史对话 |
+| `messages` | 对话里每条消息 | 展示对话内容 |
+
+**MySQL 和 Redis 的分工**：
+
+- **MySQL**：持久化——用户信息、设备绑定关系、历史对话。关机后还在。
+- **Redis**：实时状态——谁在线、设备心跳、接口限流计数。丢了也能靠心跳重建。
+
+比如"设备当前在线/离线"存在 Redis（HSET + EXPIRE 120s），因为它变化快、读写频繁。但"设备属于哪个用户"存在 MySQL——绑定关系不能丢。
+
+---
+
+### 三、Go 项目的分层架构
+
+一个 HTTP 请求的完整路径：
+
+```
+客户端 POST /auth/register
+  → cmd/server/main.go        （组装所有组件，启动服务器）
+  → internal/middleware/       （安检：没 JWT → 401，有 → 解析 userID → 放行）
+  → internal/handler/          （门面：收 HTTP 参数 → 调 service → 返回统一 {code,msg,data}）
+  → internal/service/          （大脑：业务规则、校验、编排调用顺序）
+  → internal/repository/       （管家：和数据库/Redis 对话，所有 SQL 写在这里）
+  → internal/model/            （数据结构：Go struct ↔ 数据库行的映射）
+```
+
+**铁律**（违反即分层崩塌）：
+
+```
+handler → service → repository
+   ✓         ✓          ✓
+
+永远不允许：
+  ✗ handler 直接调 repository（跳过了 service，业务规则无处放）
+  ✗ service 直接拼 SQL 字符串（跳过了 repository，SQL 散落各处）
+  ✗ repository 返回 HTTP 状态码（污染了数据层）
+```
+
+#### 对应你的 C++ 代码
+
+| Go 层 | C++ WebServer 对应 |
+|---|---|
+| `handler` | `HttpConn::process()` 里解析 HTTP 头和 body 的部分 |
+| `service` | `HttpConn::process()` 里做判断/调用/组装结果的业务逻辑 |
+| `repository` | `MySQLPool::query()` 执行 SQL 的部分 |
+| `model` | `struct User { int id; string phone; }` 头文件 |
+| `middleware` | `if (fd_ == -1) { send_error(401); return; }` 鉴权检查 |
+| `config` | 命令行参数 / ini 配置文件解析 |
+
+**为什么在 C++ 里全混在一个函数里没事，Go 里要分层**：
+
+C++ WebServer 是一个教学项目，500 行逻辑集中在一个 `HttpConn::process()` 里你能驾驭。但这个 Go 项目有 WebSocket Hub（Week 2）+ LLM 链路（Week 3）+ MQTT 通信，总行数至少 2000+。不分层的话，当你 Week 3 回来看 Week 1 代码时，你已经不知道 SQL 写在哪里了。
+
+**每一层只有被上层调用，层级之间不跳跃。这使得：**
+
+- 改数据库驱动（从 MySQL 换 PostgreSQL）→ 只改 repository
+- 改 HTTP 返回格式（加个字段）→ 只改 handler
+- 改密码强度规则 → 只改 service
+- 其他层完全不动
+
+---
+
+### 四、sqlx 四个核心方法
+
+| 方法 | 用途 | 示例 |
+|---|---|---|
+| `DB.Get(&dest, sql, args...)` | 查**一行** | `DB.Get(&user, "SELECT * WHERE phone=?", phone)` |
+| `DB.Select(&dest, sql, args...)` | 查**多行** | `DB.Select(&users, "SELECT * WHERE status=?", "online")` |
+| `DB.Exec(sql, args...)` | 写操作，不关心返回值 | `DB.Exec("DELETE FROM users WHERE id=?", id)` |
+| `DB.NamedExec(sql, struct)` | 写操作，用 struct 字段名匹配占位符 | `DB.NamedExec("INSERT INTO users (name) VALUES (:name)", user)` |
+
+### 五、为什么不用 GORM
+
+| | GORM | sqlx |
+|---|---|---|
+| SQL 可见性 | 隐藏——`db.Where(...).First(&user)` 你不知道生成了什么 SQL | 透明——你就是写 SQL 的人 |
+| 学习对象 | 学的是 GORM 方言（Preload、Joins、Association） | 学的是标准 SQL + Go 类型映射 |
+| 面试排查 | 慢查询？你得先让 GORM 打日志看它生成了什么 SQL | 慢查询？这就是你写的 SQL，直接 EXPLAIN |
+| 适用人群 | 不想写 SQL 的新手 | 你——C++ 里手写过 `mysql_real_query()`，SQL 不是问题 |
+
+**核心原则**：你已有 SQL 能力，sqlx 只是帮你去掉了 C++ 里 `while(row = mysql_fetch_row(res)) { 手动赋值到 struct }` 的体力活。GORM 则是在你的 SQL 能力上套了一层自己发明的方言——你学的不是"Go 怎么操作数据库"，而是"GORM 怎么隐藏数据库"。
+
+---
+
+## Day 3 答疑笔记：深入理解数据库层的每个细节
+
+> 以下是我在实际写代码过程中提出的问题，以及搞懂后的理解。
+
+### Q1：sqlx 到底是干啥的？和 database/sql、mysql driver 的关系？
+
+**真实的三层架构**：
+
+```
+你的代码
+    │
+    ▼
+sqlx.DB ──┬── 内嵌 *sql.DB ──→  连接池、Ping、Exec、事务
+          │                    （database/sql 标准库干的）
+          │
+          └── 自己的能力 ──→  DB.Get / DB.Select / DB.NamedExec
+                              （sqlx 干的，省掉手动逐行赋值）
+```
+
+**sqlx 不是"只是一个翻译器"——它内嵌了标准库的 `*sql.DB`，继承所有连接池能力，再在上面加 struct 映射。** 我们平时只跟 sqlx 打交道，但它大部分活是透传给 `database/sql` 干的。因为 Go 的 struct 内嵌让 `sqlx.DB` 和 `*sql.DB` 看起来像一个东西。
+
+### Q2：为什么匿名 import mysql driver？（`_ "github.com/go-sql-driver/mysql"`）
+
+下划线 `_` 的意思是：**执行这个包的 `init()` 函数，但我不直接用包里的任何导出符号**。
+
+```go
+// go-sql-driver/mysql 内部：
+func init() {
+    sql.Register("mysql", &MySQLDriver{})  // 把自己注册到 database/sql 的驱动表里
+}
+```
+
+之后你写 `sqlx.Open("mysql", dsn)` 时，database/sql 查表找到 `"mysql"` → MySQLDriver → 建连接。**没有匿名 import，注册表是空的，`sqlx.Open("mysql", dsn)` 直接报 `unknown driver`。**
+
+这个设计的好处：换 PostgreSQL 只需要改两行——把 mysql driver 的匿名 import 换成 pg driver，Open 的 `"mysql"` 改成 `"postgres"`，其他所有代码完全不变。因为所有操作走的是 `database/sql` 标准接口，不是 MySQL 专有 API。
+
+### Q3：sqlx.Open() 和 db.Ping() 分别做了什么？
+
+**`sqlx.Open("mysql", dsn)`**：
+- 在内存里创建一个 `sqlx.DB` 对象，初始化连接池数据结构
+- **不拨号，不 TCP 握手，不验证密码**
+- 只要驱动存在，Open 永远不报错
+
+**`db.Ping()`**：
+- 真的拨号到 MySQL，TCP 三次握手 → MySQL 握手协议 → 发 `SELECT 1` → 拿到响应
+- 验证一切：地址可达、用户名密码对、数据库存在、网络通
+- 成功后把连接放回池子里
+
+**为什么拆成两步**：你可以在 Open 和 Ping 之间设置连接池参数：
+
+```go
+db, _ := sqlx.Open("mysql", dsn)  // 创建对象
+db.SetMaxOpenConns(25)             // 配置池子——必须先有对象才能调
+db.SetMaxIdleConns(5)
+db.SetConnMaxLifetime(time.Hour)
+db.Ping()                          // 配置好了再真正连接
+```
+
+对应你 C++ 的 `mysql_real_connect()`——C++ 一个函数同时做了 Open + Ping 两件事。Go 拆成两步是为了让你在中间插入配置。
+
+### Q4：model/user.go 和 migrations/001_init.sql 是什么关系？
+
+**没有代码层面的联系。** 这两套东西靠你手动保持一致。
+
+```
+001_init.sql → MySQL 里 users 表的列定义
+user.go      → Go struct，db tag 告诉 sqlx "MySQL 的 phone 列对应 User.Phone 字段"
+```
+
+**运行时怎么串起来的**：sqlx 执行 SELECT 拿到结果后，用反射读 struct 的 db tag，建立列名 → 字段的映射表，然后自动填充。**sqlx 不会去读 001_init.sql，不会去查 MySQL 的表结构，只认 struct 上的 `db:"xxx"`。** 因此 SQL 列名和 db tag 必须一致——但这是你手动保持的，没有编译器检查。
+
+model 包不需要 import sqlx——它是纯数据定义，不知道什么叫数据库。读 tag 的是 sqlx（运行时反射）。
+
+### Q5：DB.Get() 内部做了哪几步？
+
+```go
+err := DB.Get(&user, "SELECT id,phone,... FROM users WHERE phone=?", phone)
+```
+
+1. **预编译**：把 `?` 替换成参数值，防止 SQL 注入。`?` 不是字符串拼接——sqlx 底层调 `database/sql` 的 `Prepare()`，参数和 SQL 结构分开传输。对应 C++ 的 `mysql_stmt_prepare()` + `mysql_stmt_bind_param()`。
+2. **执行**：发 SQL 给 MySQL。对应 C++ 的 `mysql_real_query()`。
+3. **映射**：用反射读 user struct 的 db tag，找到 `phone` 列 → `User.Phone` 字段，自动填充。
+4. **返回**：填充好的 `*model.User`。
+
+这一步替代了你 C++ 里 20 行：`mysql_stmt_init → prepare → bind_param → execute → store_result → bind_result → fetch → 手动逐列赋值 → close`。
+
+### Q6：SQL CRUD 四条语句
+
+| 语句 | 作用 | 模式 |
+|---|---|---|
+| `SELECT 列 FROM 表 WHERE 条件` | 读数据 | 查 |
+| `INSERT INTO 表 (列...) VALUES (值...)` | 写新数据 | 增 |
+| `UPDATE 表 SET 列=值 WHERE 条件` | 修改已有数据 | 改 |
+| `DELETE FROM 表 WHERE 条件` | 删除数据 | 删 |
+
+**不加 WHERE 的 UPDATE/DELETE 会操作全表**——这是不可逆的。
+
+SELECT 显式列出列名（不用 `SELECT *`）的原因：
+- `SELECT *` 以后表加了新列，sqlx 发现 struct 上没有对应字段可能报错
+- 显式列名让你一眼看懂了返回哪些字段
+
+### Q7：Go 包级变量的可见性
+
+**`var DB *sqlx.DB`（大写 D）→ 整个项目都能访问。**
+**`var db *sqlx.DB`（小写 d）→ 只有 repository 包能访问。**
+
+对应 C++ 的 public/private：
+
+```
+大写 = 公开（包外 `repository.DB` 可用）
+小写 = 包内私有（只有同一个 package 的文件能访问）
+```
+
+跟是不是全局变量没关系，只看首字母大小写。Go 没有 `public`/`private` 关键字，用首字母大小写决定可见性。
+
+### Q8：编译踩坑 — `undefined: addr`
+
+往 main.go 加了 cfg 初始化后，原来的 `addr := ":8080"` 丢了。修复用 config 的 Port：
+
+```go
+addr := ":" + cfg.Port  // 从环境变量/默认值 7777 取端口
+```
+
+config.go 的 `Load()` 读环境变量 PORT，默认值 `"7777"`，所以最终 `addr = ":7777"`。
