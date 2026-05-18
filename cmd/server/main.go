@@ -3,12 +3,16 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/SinnerK9/my-iot-server/internal/config"
+	"github.com/SinnerK9/my-iot-server/internal/repository"
 )
 
 func main() {
@@ -18,8 +22,18 @@ func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	})))
-	//监听本机8080
-	addr := ":8080"
+
+	//加载配置 + 初始化数据库
+	cfg := config.Load()
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&parseTime=true&loc=Local",
+		cfg.DBUser, cfg.DBPass, cfg.DBHost, cfg.DBPort, cfg.DBName)
+	if err := repository.InitDB(dsn); err != nil {
+		slog.Error("init db failed", "err", err)
+		os.Exit(1)
+	}
+	defer repository.CloseDB() //延后执行closedb
+
+	addr := ":" + cfg.Port
 
 	//ServeMux是Go的路由管理器，其作用是根据请求路径找到对应的处理函数
 	mux := http.NewServeMux()
