@@ -5,7 +5,7 @@
 */
 
 CREATE TABLE IF NOT EXISTS users(
-    id BIGINT UNSIGNED_AUTO_INCREMENT PRIMARY KEY, -- 存用户id：无符号自动递增主键
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, -- 存用户id：无符号自动递增主键
     phone VARCHAR(20) NOT NULL DEFAULT '', -- 存用户电话号码，不能为空，默认为空字符串
     email VARCHAR(100) NOT NULL DEFAULT '',
     password VARCHAR(100) NOT NULL COMMENT 'bcrypt hash', -- 存密码：密码存的是 bcrypt 加密后的 hash，不是明文密码

@@ -324,7 +324,7 @@ migrations/
 3. Git 版本控制能 diff 出来——"周三关梓浩加了个 avatar 字段，看 002_add_avatar.sql"。
 4. 新环境 `docker compose up -d` 时，MySQL 容器的 `docker-entrypoint-initdb.d` 机制按文件名顺序执行所有 `.sql` 文件，得到完全一致的数据库结构。
 
-#### 为什么这很重要（面试金句）
+#### 为什么这很重要
 
 > "数据库 schema 和代码一样，必须受版本控制。Migrations 是数据库变更的唯一执行通道，它保证了所有环境（开发/测试/生产）的结构一致性。代码回滚时，你能精确知道数据库处于哪个 schema 版本。"
 

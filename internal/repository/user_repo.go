@@ -17,6 +17,15 @@ func GetUserByPhone(phone string) (*model.User, error) {
 	return &user, nil
 }
 
+func GetUserByEmail(email string) (*model.User, error) {
+	var user model.User
+	err := DB.Get(&user, "SELECT id,phone,email,nickname,created_at,updated_at FROM users WHERE email=?", email)
+	if err != nil {
+		return nil, fmt.Errorf("GetUserByEmail: %w", err)
+	}
+	return &user, nil
+}
+
 func ListUsers() ([]model.User, error) {
 	var users []model.User
 	// Select：查多行，自动 append + StructScan 每行。
