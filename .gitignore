@@ -4,6 +4,6 @@
 .env
 .idea/
 .vscode/
-server
+/server
 .claude/
 CLAUDE.md
