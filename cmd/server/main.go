@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"github.com/SinnerK9/my-iot-server/internal/config"
+	"github.com/SinnerK9/my-iot-server/internal/handler"
 	"github.com/SinnerK9/my-iot-server/internal/repository"
+	"github.com/gin-gonic/gin"
 )
 
 func main() {
@@ -33,20 +35,15 @@ func main() {
 	}
 	defer repository.CloseDB() //延后执行closedb
 
+	r := gin.Default()
+	r.GET("/v1/health", handler.Ping)             // 健康检查，复用已有的
+	r.POST("/v1/auth/register", handler.Register) // 注册
+	r.POST("/v1/auth/login", handler.Login)       // 登录
+
 	addr := ":" + cfg.Port
-
-	//ServeMux是Go的路由管理器，其作用是根据请求路径找到对应的处理函数
-	mux := http.NewServeMux()
-	//前一个字符串指定路径
-	//后面的匿名函数即为处理函数，w用于给客户端返回数据，r是客户端发来的请求
-	mux.HandleFunc("v1/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json") //返回格式是JSON
-		w.Write([]byte(`{"status":"ok"}`))
-	})
-
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           mux,              //交给上面创造的路由mux处理请求
+		Handler:           r,                //Gin实现了Handler接口，直接传给server
 		ReadHeaderTimeout: 10 * time.Second, //十秒超时
 	}
 
