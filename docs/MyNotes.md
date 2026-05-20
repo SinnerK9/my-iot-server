@@ -554,3 +554,166 @@ addr := ":" + cfg.Port  // 从环境变量/默认值 7777 取端口
 ```
 
 config.go 的 `Load()` 读环境变量 PORT，默认值 `"7777"`，所以最终 `addr = ":7777"`。
+
+---
+
+## Day 4：注册/登录 API — 整条业务链路从零到跑通
+
+### 一、Day 4 到底做了什么
+
+Day 1-3 已经搭好了基础设施（Gin 骨架、配置管理、sqlx 连接池、模型层），但这些都是**准备动作**——没有一条从客户端请求到数据库响应的完整链路。
+
+Day 4 的核心命题：**把数据库能力穿上 HTTP 的外衣**，让外部世界可以通过 REST API 注册和登录。
+
+**注册请求的完整旅程**：
+
+```
+客户端 POST /v1/auth/register
+  {"phone":"138...","email":"t@t.com","password":"12345678","nickname":"test"}
+    │
+    ▼
+  Gin Router (main.go)     ← URL → 处理函数的映射表
+    │
+    ▼
+  Handler 层                ← HTTP 协议相关的事：读请求体、校验参数、返回 JSON
+    c.ShouldBindJSON(&req)   ← JSON 反序列化 + binding tag 校验，一步完成
+    service.Register(&req)   ← 把活交给下层，自己不碰业务规则
+    model.OK(c, data)        ← 包装 JSON 响应
+    │
+    ▼
+  Service 层                ← 纯业务逻辑：查重、哈希、写入
+    ├── 检查手机号是否已注册
+    ├── 检查邮箱是否已注册
+    ├── bcrypt 哈希密码
+    └── repository.CreateUser(user)
+    │
+    ▼
+  Repository 层             ← 只做数据库操作：SQL + sqlx 映射
+    DB.NamedExec("INSERT INTO users ...", user)
+    │
+    ▼
+  MySQL (Docker 3307)       ← users 表多了一行，password 列是 bcrypt 密文
+```
+
+### 二、对 Gin 框架的具象理解——它到底替代了什么
+
+我在 Day 1 用的是标准库 `net/http`：
+
+```go
+// 标准库 handler：两个参数
+mux.HandleFunc("v1/health", func(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "application/json")  // 手动设头
+    w.Write([]byte(`{"status":"ok"}`))                   // 手动写字节
+})
+```
+
+Gin 给了一个增强版的 handler 接口：
+
+```go
+func Ping(c *gin.Context) {
+    c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+```
+
+**`c *gin.Context` 是什么**：它就是把 `w http.ResponseWriter` 和 `r *http.Request` 合并成一个对象，再加了一堆便利方法。
+
+| 标准库写法 | Gin 写法 | 少写了什么 |
+|---|---|---|
+| `r.URL.Query().Get("token")` | `c.Query("token")` | 从 Request 取参数 |
+| `json.NewDecoder(r.Body).Decode(&v)` | `c.ShouldBindJSON(&v)` | JSON 反序列化 + 校验 |
+| `w.Header().Set("Content-Type", ...)` + `json.NewEncoder(w).Encode(obj)` | `c.JSON(200, obj)` | 设头 + 序列化 + 写入，一步 |
+| `w.WriteHeader(400)` | `c.Status(400)` | 设状态码 |
+| `r.Method` | `c.Request.Method` | 通过 c 仍能拿到原始 Request |
+
+**Gin 没有替代 `net/http`——底层还是 `http.Server`**。`gin.Default()` 返回的对象实现了 `http.Handler` 接口，所以可以原样传给 `&http.Server{Handler: r}`。graceful shutdown 逻辑也完全不用改——`srv.Shutdown()` 对 Gin 和标准库是一样的，因为底层是同一个 `http.Server`。
+
+对应你 C++ 的经验：标准库相当于裸调 `socket+bind+listen+epoll`，Gin 相当于你的 `HttpConn::process()` 之上加了一层路由分发和参数解析——但底层 epoll 循环仍然是 Go runtime 在跑，Gin 不碰那一层。
+
+### 三、struct tag 的三位读者
+
+struct tag 看起来像注释，但其实是**给特定库看的配置字符串**。Go 编译器不管 tag 里写了什么，每个库用反射去读自己关心的那部分。
+
+```go
+Phone string `json:"phone" binding:"required,len=11" db:"phone"`
+//             └── json 库读  └── Gin validator 读 ──┘ └── sqlx 读
+```
+
+| tag | 谁读 | 什么时候 | 做了什么 |
+|---|---|---|---|
+| `json:"phone"` | `encoding/json` | 序列化/反序列化 | JSON 里叫 `phone` ↔ Go 里叫 `Phone` |
+| `binding:"required,len=11"` | Gin 的 `ShouldBindJSON` | 解析请求体时 | 校验：非空、11 位 |
+| `db:"phone"` | sqlx 的 `StructScan` | SQL 行 → struct | 数据库列 `phone` ↔ `User.Phone` |
+
+**三个 tag 互不干扰，各读各的。** Response struct 没有 `binding` 和 `db` tag，因为它只管输出 JSON。User model 没有 `json` tag（用了 `db` tag），因为它只管数据库映射——API 返回时用 `gin.H` 手动构建 JSON，不直接序列化 User。
+
+### 四、统一响应格式 {code, msg, data}
+
+前后端约定一个外壳：
+
+```json
+{"code": 0, "msg": "ok", "data": {...}}
+```
+
+- **`code`**：给机器判断（`if res.code === 0`）
+- **`msg`**：给人看（弹出提示、调试日志）
+- **`data`**：真正的业务数据
+
+为什么不能每个接口返回不同格式——如果注册返回 `{"success":true}`，登录返回 `{"status":"ok"}`，前端要针对每个接口写不同判断。统一格式让前端只需一段判断逻辑。
+
+**`interface{}` 就是 C++ 的 `void*`**——可以接收任何类型，所以 data 字段可以是用户对象、列表、数字、nil。
+
+### Q1：pkg 层到底放什么？为什么是 hashutil 而不是 utils？
+
+`pkg/` 放的是和业务无关的纯工具——换个项目也能直接用。`internal/` 放的是这个项目私有的实现，外部不能 import。
+
+Go 风格是**小包优先**：`pkg/hashutil/`（2 个函数）、`pkg/jwtutil/`（3 个函数），而不是一个 `pkg/utils/` 装十几个不相关的函数。
+
+好处：`hashutil.HashPassword()` 读起来是自然语言，import 列表一眼就知道依赖了什么。编译也更快——改 hashutil 只影响用它的文件，不会连累 jwtutil。
+
+### Q2：bcrypt 原理——为什么用 cost=10
+
+bcrypt 是专门设计来抵抗暴力破解的**慢哈希**：
+
+```
+"12345678" → 生成 16 字节随机 salt → 对 salt+password 做 2^10 = 1024 轮 Blowfish 加密
+→ 输出 "$2a$10$<22字符salt><31字符hash>"
+```
+
+- **cost=10 就是 1024 轮**，一次验证大约 50-100ms——对用户无感，对暴力破解是灾难（试 100 万个密码需要约 30 小时）
+- **salt 直接编码在输出里**，`CompareHashAndPassword` 自动从 hash 提取 salt 用于验证，不需要单独存储
+- **SHA-256 不适合存密码**：它是快哈希，GPU 每秒能跑几十亿次；bcrypt 用 1024 轮刻意拖慢
+
+### Q3：注册/登录安全——"账号或密码错误"为什么不区分
+
+不管账号不存在还是密码不对，都返回同一个消息。这不是糊弄用户——如果区分"账号不存在"和"密码错误"，攻击者可以用差异来枚举注册了哪些账号（user enumeration）。**不泄露用户存在性**是安全基线。
+
+### 五、今天踩的坑
+
+1. **migrations SQL 注释导致建表失败**：MySQL 的 `--` 注释要求 `-- `（双横线后面有空格）。写了 `--注册时间`（没空格）→ MySQL 不认识 → `ERROR 1064 (42000)` → 表没建。改成不用行内注释，说明文字放在 SQL 外面的 COMMENT 子句里。
+
+2. **Docker MySQL 初始化脚本只跑一次**：`docker-entrypoint-initdb.d` 机制只在 MySQL 数据目录**第一次初始化**时执行。后来改了 SQL 文件，`docker compose down -v` 删数据卷重建才行。
+
+3. **非业务错误被吞掉**：Handler 里系统错误返回了 `5000` 但没有打 `slog.Error`——根本不知道数据库返回了什么错。加上 `slog.Error("Register failed", "err", err)` 后从日志秒定位到 `Table 'iot_gateway.users' doesn't exist`。
+
+4. **`.gitignore` 的 `server` 模式误拦了 `cmd/server/`**：`server` 是匹配任意路径组件名，所以 `cmd/server/main.go` 也被忽略。改成 `/server`（只匹配根目录）解决。
+
+### 六、今天新掌握的工具
+
+```bash
+docker logs iot-mysql                          # 看容器日志（建表错误在这里）
+docker exec -i iot-mysql mysql -uroot -pXXX DB < file.sql  # 手动执行 SQL
+docker compose down -v                          # 删除容器 + 数据卷（重建用）
+```
+
+### 七、全服务链路验证
+
+运行 `go run ./cmd/server/` 后 curl 测试结果：
+
+```
+注册 → {"code":0,"msg":"ok","data":{"user_id":1}}    ✅
+重复注册 → {"code":4090,"msg":"手机号已被注册","data":null}  ✅
+登录 → {"code":0,"msg":"ok","data":{...用户信息...}}   ✅
+密码错误 → {"code":4010,"msg":"账号或密码错误","data":null} ✅
+```
+
+整条链路：`curl JSON → Gin 路由 → ShouldBindJSON 校验 → Service 逻辑 → bcrypt 哈希 → repository NamedExec → MySQL INSERT → 返回统一 JSON`，全部跑通。
