@@ -717,3 +717,280 @@ docker compose down -v                          # 删除容器 + 数据卷（重
 ```
 
 整条链路：`curl JSON → Gin 路由 → ShouldBindJSON 校验 → Service 逻辑 → bcrypt 哈希 → repository NamedExec → MySQL INSERT → 返回统一 JSON`，全部跑通。
+
+
+---
+
+## Day 5：JWT 双 Token 工具包 — Access(15min)+Refresh(7d)+ParseToken
+
+### 一、从硬编码登录到 JWT——我的起点
+
+我的 C++ WebServer 的登录是这样的：
+
+```cpp
+const string ADMIN_USER = "admin";
+const string ADMIN_PASS = "123456";
+if (req.username == ADMIN_USER && req.password == ADMIN_PASS) {
+    // 放行
+}
+```
+
+这是**硬编码单用户认证**——用户名密码写死在代码里，只区分"通过"和"不通过"两个状态。没有会话概念，没有多用户，没有过期机制。
+
+Day 5 的实际产出是 `pkg/jwtutil/` 工具包——提供 token 的生成和验证能力，供 Day 5 后半段（middleware + handler 改造）使用。今天先把这个"核心发动机"讲透。
+
+### 二、Session vs JWT——两种"记住你是谁"的方案
+
+你登录成功后，下一次请求怎么证明"刚才登录过了"？两种方案：
+
+**方案 A：服务端 Session**
+
+```
+登录成功 → 服务器生成随机 session_id → 存入 Redis: session_id → userID
+后续请求 → 客户端带 session_id → 服务器查 Redis → 拿到 userID
+```
+
+这是最直观的方案——对应 C++ 里你可能会做 `std::unordered_map<string, int> sessions`。
+
+| 优点 | 缺点 |
+|---|---|
+| 服务端随时可以踢人（删 session） | 每次请求要查 Redis/内存 |
+| 实现简单 | 服务器重启 → 内存 session 全丢 |
+
+**方案 B：JWT（我们选的方案）**
+
+```
+登录成功 → 服务器把 userID 签名进 token → 把 token 字符串返回客户端
+后续请求 → 客户端带 Authorization: Bearer <token> → 服务器验签 → 直接读 userID
+```
+
+| 优点 | 缺点 |
+|---|---|
+| 验签是纯数学运算，不查数据库/Redis | 签发后无法直接撤销 |
+| 无状态——服务器重启不受影响 | 如果 token 泄露，在过期前攻击者能一直用 |
+
+**我们为什么选 JWT**：Week 2 要做 WebSocket Hub——几百个设备长连接，每个连接都要鉴权。如果用 Session，每个 WS 握手都要查 Redis，延迟会累积。JWT 验签不产生任何 I/O，微秒级完成。
+
+### 三、JWT 是什么——三部分拼接的字符串
+
+```
+eyJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoxLCJleHAiOjE3NDc4NTI4MDB9.SvuRxKdq...
+    ↑                        ↑                             ↑
+  Header                   Payload                       Signature
+  {"alg":"HS256"}    {"user_id":1,"exp":...}       HMAC-SHA256(Header.Payload, secret)
+```
+
+**三段都是 Base64 编码**——不是加密！Base64 只是把二进制字节转成 64 个可打印字符，任何人都能解码看内容。你把 Payload 那段 Base64 解码，直接就能看到 `{"user_id": 1}`。
+
+**安全性不靠"看不见"，靠"改不了"**——第三段签名保证了前两段没有被篡改。签名的正确性依赖于只有服务器持有的 secret。
+
+### 四、secret 本质——一把服务器独有的钥匙
+
+`secret` 是一个字节数组 `[]byte`，从配置文件的 `JWT_SECRET` 环境变量读进来：
+
+```go
+var secret []byte  // = []byte("dev-secret-change-in-production")
+func Init(secretKey string) { secret = []byte(secretKey) }
+```
+
+这把钥匙永远不离开服务器。它不出现在 token 里，不出现在 HTTP 响应里，客户端完全不知道。Token 里没有 secret——签名是 secret 的"作用结果"，不是 secret 本身。
+
+HS256（HMAC-SHA256）是对称密钥算法——加密和验证用同一把钥匙。为什么不用 RS256（非对称）？因为我们的 Go Server 是单体——签发者和验证者是同一个进程，不需要公私钥分离。
+
+### 五、签名 ≠ 加密——这是最容易混淆的地方
+
+**加密**：把内容变乱码，只有有密钥的人能解开看。
+
+```
+原文:  "user_id=1"
+加密:  "a7f3c9e1b4..."  → 谁也看不懂
+解密:  "user_id=1"      → 用密钥变回来
+```
+
+**签名**：原文大家都能看，附加一段"防伪标识"。任何人能验证这个防伪标识是真的，但只有有密钥的人能生成它。
+
+```
+原文:   "user_id=1"           → 任何人都能读
+签名:   "d8a2f1..."           → 附在原文后面
+验证:   原文 + 签名 + secret → ✓ 没被改过 / ✗ 被篡改了
+```
+
+**现实类比**：你给朋友写一封信（Payload），信的内容谁都可以看。你用特殊印章（secret）在封蜡上盖戳（签名）。朋友收到信，看到封蜡的戳印，确认是你的印章图案——信没被拆、没被换过。如果有人拆了信换了内容，他的印章图案和你不一样——朋友一眼看出"这个戳不对"。
+
+### 六、`token.SignedString(secret)` 内部四步
+
+这是 `jwt.go` 里 Generate 函数最后调的那行——真正产生签名、拼接最终 token 字符串。
+
+```go
+token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+return token.SignedString(secret)
+```
+
+`NewWithClaims` 创建的是一个**未签名的 Token 对象**——只是一个数据容器，打包了 Header + Payload + 算法信息。此时签名是空的、Valid 是 false。
+
+`SignedString(secret)` 做四件事：
+
+**第一步——序列化 Header 并 Base64 编码**：
+
+```
+{"alg":"HS256","typ":"JWT"}  →  json.Marshal  →  Base64  →  "eyJhbGciOiJIUzI1NiJ9"
+```
+
+**第二步——序列化 Payload(Claims) 并 Base64 编码**：
+
+```
+{"user_id":1,"exp":1747852800,"iat":1747851900}  →  json.Marshal  →  Base64  →  "eyJ1c2Vy..."
+```
+
+这里用 `base64.RawURLEncoding` 而不是 `StdEncoding`——JWT 标准规定用 URL 安全的 Base64（`-` `_` 替代 `+` `/`，末尾不加 `=`），因为 token 要放在 HTTP header 里，这些字符在 URL 和 header 中有特殊含义。
+
+**第三步——计算 HMAC-SHA256 签名**：
+
+```
+signingInput = headerB64 + "." + claimsB64
+signature = HMAC-SHA256(signingInput, secret)   →  32 字节二进制
+sigB64 = base64(signature)
+```
+
+**第四步——拼接最终 token**：
+
+```
+headerB64 + "." + claimsB64 + "." + sigB64
+```
+
+JWT 库把 30 行逻辑（序列化、Base64、HMAC 计算、拼接）封装成了一个方法调用。
+
+### 七、HMAC-SHA256 原理——secret 怎么参与签名
+
+HMAC = Hash-based Message Authentication Code（基于哈希的消息认证码）。
+
+公式：
+```
+HMAC-SHA256(message, secret) = SHA256(
+    (secret XOR opad) || SHA256((secret XOR ipad) || message)
+)
+```
+
+人话翻译：
+
+1. 密钥不够 64 字节 → 用 0 补到 64 字节
+2. 用两个固定魔数搅拌密钥：`inner_key = secret XOR 0x3636...`，`outer_key = secret XOR 0x5C5C...`
+3. 内层哈希：`SHA256(inner_key + Payload)` → 32 字节
+4. 外层哈希：`SHA256(outer_key + 内层结果)` → 32 字节最终签名
+
+**为什么是两层**：防止 SHA-256 的长度扩展攻击（length extension attack）。裸 `SHA256(key+message)` 可以被攻击者在不知道 key 的情况下追加数据并算出有效哈希。HMAC 的双层结构阻断了这个攻击面。
+
+**secret 参与了两层**——每层都有被不同魔数搅拌的密钥混入。攻击者没有 secret，就凑不出正确的 32 字节签名。
+
+### 八、解析验证到底验证了什么——三个问题
+
+```go
+func ParseToken(tokenString string) (*Claims, error) {
+    // 1. 拆三段
+    parts := strings.Split(tokenString, ".")
+    headerB64, payloadB64, sigB64 := parts[0], parts[1], parts[2]
+
+    // 2. 用同样的 secret 重新算签名
+    我自己算的签名 := HMAC-SHA256(headerB64 + "." + payloadB64, secret)
+
+    // 3. 比对——逐字节比较
+    if 我自己算的签名 != base64Decode(sigB64) {
+        return nil, error("签名不匹配——Payload 被改过")   // 验证失败①
+    }
+
+    // 4. 检查过期时间
+    if claims.ExpiresAt < time.Now() {
+        return nil, error("Token 已过期")                  // 验证失败②
+    }
+
+    return claims, nil  // 全部通过
+}
+```
+
+验证回答三个问题：
+
+| 步骤 | 问题 | 机制 |
+|---|---|---|
+| 签名比对 | "这个 token 是我们签发的吗？Payload 被改过吗？" | 只有持有 secret 的人才能产生匹配的签名。Payload 改一个字节 → 签名必然对不上 |
+| exp 检查 | "token 还在有效期内吗？" | 现在时间 > exp → 过期 |
+
+验证**不回答**的问题：
+- "签发之后这个 token 有没有被撤销？"——不知道（JWT 无状态，不查数据库）
+- "签发者是谁？"——知道但我们没设 `iss` 字段
+
+### 九、双 Token 设计——解决"安全 vs 体验"的矛盾
+
+如果只有一个 token：设短了用户频繁登录，设长了泄露后危害大。两个 token 把矛盾拆成两个维度：
+
+| | Access Token | Refresh Token |
+|---|---|---|
+| 有效期 | **15 分钟** | **7 天** |
+| 用途 | 每次 API 请求 | 只用来换新的 Access Token |
+| 传输频率 | 每请求一次 | 15 分钟甚至更久才用一次 |
+| 被盗后果 | 15 分钟后自动失效 | 做 Token Rotation 可被动检测 |
+
+**Token 生命周期**：
+
+```
+00:00  登录 → 拿 Access(A) + Refresh(R)
+00:10  正常用 A 调 API
+00:16  A 过期 → 用 R 换新的 A' + R'（R 同时刷新，旧 R 失效）
+6 天后  如果一直活跃，R 被不断刷新，实际有效期可远超 7 天
+7 天后  如果 7 天没登录，R 也过期 → 重新输入密码
+```
+
+**Token Rotation（旋转）**：刷新 Access 时同时换新的 Refresh Token。如果 Refresh Token 被窃取，你和攻击者同时用它刷新——先到服务器的拿新 token，另一个人的旧 token 就废了。你下次用旧 token 刷新时失败 → 知道自己被攻击 → 重新登录。这是一种"被动安全探测"机制。
+
+### 十、jwt.go 的五个设计决策
+
+| # | 决策点 | 选了 | 为什么 |
+|---|---|---|---|
+| 1 | 暴露什么接口 | 3 个函数 + 1 个 Init | 最小暴露——调用方只需要 Generate 和 Parse |
+| 2 | 密钥怎么管理 | 包级变量 + Init | 学习项目够用，调用方不感知密钥细节 |
+| 3 | Claims 里存什么 | userID + exp + iat | 最少够用——handler 拿到 userID 后自己查库 |
+| 4 | 算法 | HS256（对称） | 单体服务，无需公私钥分离 |
+| 5 | 有效期放在哪 | 包内常量，两个独立函数 | 策略内聚，调用方不需要知道"几分钟过期" |
+
+### 十一、jwt_test.go——单元测试验证完整回路
+
+```go
+func TestGenerateAndParse(t *testing.T) {
+    Init("test-secret")
+    token, _ := GenerateAccessToken(42)     // 生成
+    claims, _ := ParseToken(token)           // 验证
+    // claims.UserID == 42 → 生成和验证是同一把 secret → 回路通
+}
+
+func TestTamperedToken(t *testing.T) {
+    Init("test-secret")
+    token, _ := GenerateAccessToken(1)
+    tampered := token[:len(token)-1] + "X"  // 篡改最后一个字符
+    _, err := ParseToken(tampered)
+    // err != nil → 篡改被检测出来了
+}
+```
+
+这两个测试覆盖了：正常生成+验证回路、篡改检测。
+
+### 十二、今天踩的坑
+
+1. **测试文件重复代码导致编译失败**：`jwt_test.go` 末尾多了一段 `if err == nil { ... }`，不在函数内部。Go 编译器报 `expected declaration, found 'if'`。删掉重复的 4 行解决。
+
+2. **CRLF 警告**：Git 在 Windows/WSL 混合环境下反复警告 `LF will be replaced by CRLF`。这是 WSL 和 Windows 文件系统之间的换行符转换问题——Git 的 `core.autocrlf` 配置项。对代码行为无影响，暂时忽略。
+
+### 十三、当前进度与测试结果
+
+Day 5 实际完成的文件：
+
+| 文件 | 操作 | 作用 |
+|---|---|---|
+| `pkg/jwtutil/jwt.go` | 新建 | JWT 生成/解析核心——GenerateAccessToken / GenerateRefreshToken / ParseToken |
+| `pkg/jwtutil/jwt_test.go` | 新建 | 单元测试——正常生成+解析回路 + 篡改检测 |
+| `internal/config/config.go` | 修改 | Config struct 加 JWTSecret 字段 |
+| `go.mod` / `go.sum` | 自动 | golang-jwt/jwt/v5 依赖 |
+
+`go test ./pkg/jwtutil/` 两个用例全部通过：
+- `TestGenerateAndParse`：生成 token → 解析 token → userID 一致 → ✓ 生成和验证回路正确
+- `TestTamperedToken`：改 token 最后一个字符 → 验证失败 → ✓ 篡改被检测
+
+下一步将把 jwtutil 接入 login handler（返回 token）并编写 Auth middleware 做请求鉴权。
