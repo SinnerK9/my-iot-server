@@ -4,24 +4,26 @@ import "os"
 
 // 定义配置结构体，首位大写使得其可以被外界访问
 type Config struct {
-	Port   string
-	DBHost string
-	DBPort string
-	DBUser string
-	DBPass string
-	DBName string
+	Port      string
+	DBHost    string
+	DBPort    string
+	DBUser    string
+	DBPass    string
+	DBName    string
+	JWTSecret string //新增JWT签名密钥，用于鉴权，该密钥全局共享
 }
 
 // 从环境变量读取配置，读不到就用指定的默认值，最后返回配置结构体的指针
 func Load() *Config {
 	//Go中允许直接返回局部变量的指针，发现返回指针则将其分配在堆上
 	return &Config{
-		Port:   getenv("PORT", "7777"), //结构体变量的赋值应该用冒号
-		DBHost: getenv("DB_HOST", "127.0.0.1"),
-		DBPort: getenv("DB_PORT", "3307"),
-		DBUser: getenv("DB_USER", "root"),
-		DBPass: getenv("DB_PASS", "123456"),
-		DBName: getenv("DB_NAME", "iot_gateway"),
+		Port:      getenv("PORT", "7777"), //结构体变量的赋值应该用冒号
+		DBHost:    getenv("DB_HOST", "127.0.0.1"),
+		DBPort:    getenv("DB_PORT", "3307"),
+		DBUser:    getenv("DB_USER", "root"),
+		DBPass:    getenv("DB_PASS", "123456"),
+		DBName:    getenv("DB_NAME", "iot_gateway"),
+		JWTSecret: getenv("JWT_SECRET", "dev-secret-change-in-production"),
 	}
 }
 
