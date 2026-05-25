@@ -994,3 +994,124 @@ Day 5 实际完成的文件：
 - `TestTamperedToken`：改 token 最后一个字符 → 验证失败 → ✓ 篡改被检测
 
 下一步将把 jwtutil 接入 login handler（返回 token）并编写 Auth middleware 做请求鉴权。
+
+
+---
+
+## Day 5（续）：Middleware + JWT 接入 HTTP 层
+
+### 一、中间件到底在做什么层面的事情
+
+一个真实请求的完整调用栈：
+
+```
+Gin 收到 HTTP 请求
+  → 路径匹配 /v1/users/me → handlers 数组 = [Auth中间件, GetProfile]
+  → c.Next()
+    → handlers[0](c)  ← Auth 中间件
+        → c.GetHeader("Authorization") → token
+        → jwtutil.ParseToken(token)     → claims
+        → c.Set("userID", claims.UserID)
+        → c.Next()          ← 执行权交给下一个
+            → handlers[1](c)  ← handler.GetProfile
+                → c.Get("userID") → 类型断言 → 查库 → 返回 JSON
+            ← GetProfile 返回
+        ← 中间件的 c.Next() 返回
+    ← Gin 的 c.Next() 返回
+  → 响应发回客户端
+```
+
+中间件和 handler 是**同一个类型**——都是 `func(*gin.Context)`。区别只在行为：
+
+| | handler | 中间件 |
+|---|---|---|
+| 做什么 | 处理业务，返回响应 | 前置检查，注入数据 |
+| 调 `c.Next()` 吗 | 通常不调——它是终点 | **必须调**——把请求往下传 |
+| 调 `c.Abort()` 吗 | 不调 | 校验失败时调——截断请求链 |
+
+`c.Next()` 不是并发——是**同步调用**。中间件暂停自己，等下一个 handler 跑完，然后继续执行 `c.Next()` 后面的代码。
+
+`c.Set("key", val)` / `c.Get("key")` 是 Gin context 内部的 `map[string]interface{}` KV 存储。中间件往里写，handler 往外读。这是中间件和 handler 之间传递数据的标准方式。
+
+### 二、Auth 中间件做了什么
+
+`internal/middleware/auth.go`——路由到 handler 之前的拦截器：
+
+1. `c.GetHeader("Authorization")` —— 从 HTTP header 取 token
+2. `strings.TrimPrefix(authHeader, "Bearer ")` —— 去掉 OAuth 标准前缀，拿到纯 token
+3. `jwtutil.ParseToken(tokenString)` —— 验签 + 检查过期
+4. `c.Set("userID", claims.UserID)` —— 注入身份，供 handler 使用
+5. `c.Next()` —— 放行给下一个 handler
+
+任一环节失败 → `c.Abort()` 截断请求链，返回 4010/4011。
+
+**对应 C++**：你的 WebServer 里鉴权是写在每个 handler 开头的一段重复代码——`if (!check_auth(fd)) return send_401()`。Go 的中间件把这段重复检查抽到了一个集中位置。
+
+### 三、Login handler 改造——返回 JWT 双 token
+
+之前的 Login 直接返回 user 信息。改造后在 service.Login 验证通过后：
+
+1. `jwtutil.GenerateAccessToken(user.ID)` → 15 分钟有效期
+2. `jwtutil.GenerateRefreshToken(user.ID)` → 7 天有效期
+3. 响应里加 `expires_in: 900` —— 供前端做倒计时，提前静默刷新
+
+为什么 token 生成在 handler 层而不是 service 层：token 是 HTTP 协议的概念（Bearer 前缀、OAuth 规范），不是业务概念。以后做 CLI 或 gRPC 时换一种鉴权方式，service 不用动。
+
+### 四、RefreshToken——Token Rotation 被动安全
+
+`POST /v1/auth/refresh` 接收 refresh_token，验证通过后签发**新的 Access + 新的 Refresh**，旧的 Refresh 同时失效。
+
+这就是 Token Rotation：每次刷新都换掉 Refresh Token。如果 Refresh Token 被窃取，你和攻击者同时用它刷新——先到服务器的拿新 token，另一个人的旧 token 就废了。你下次用旧 token 刷新失败 → 知道你被攻击 → 重新登录。
+
+Refresh 端点不需要 Auth 中间件——用户正是因为没有有效的 Access Token 才来刷的。
+
+### 五、GetProfile——受保护端点
+
+`GET /v1/users/me` 在 Auth 中间件之后执行：
+
+1. `c.Get("userID")` → 取中间件注入的身份
+2. 类型断言 `raw.(uint64)` → `interface{}` 转回具体类型
+3. `repository.GetUserByID(userID)` → 查库
+4. 返回 phone/email/nickname——**不返回 password**
+
+`c.Get` 返回 `(interface{}, bool)`——第二个返回值 `exists` 告诉 key 在不在。这是防御性编程：理论上中间件保证了这一步一定拿到 userID，但如果路由配漏了没加中间件，`exists` 为 false 能做兜底。
+
+### 六、main.go 路由分组设计
+
+```go
+// 公开路由——不经过 Auth 中间件
+r.GET("/v1/health", handler.Ping)
+r.POST("/v1/auth/register", handler.Register)
+r.POST("/v1/auth/login", handler.Login)
+r.POST("/v1/auth/refresh", handler.RefreshToken)
+
+// 受保护路由组——经过 Auth 中间件
+auth := r.Group("/v1")
+auth.Use(middleware.Auth())
+{
+    auth.GET("/users/me", handler.GetProfile)
+}
+```
+
+`r.Group("/v1")` 创建路由组，组内所有路由共享前缀和中间件。不在组里的路由不受影响。
+
+### 七、今天踩的坑
+
+1. **main.go import 路径缺 `my-iot-server`**：写成了 `"github.com/SinnerK9/internal/middleware"`，少了模块名中间那段。Go 的 import 必须从 go.mod 的 module 完整路径开始。
+
+2. **`jwtutil.Init(cfg.JWTSecret)` 漏调**：没有 Init 的话 `jwtutil.secret` 是 nil（`[]byte` 零值），Login 调 `token.SignedString(nil)` 不会编译报错但运行时会炸——签名用的密钥是空的。
+
+3. **GetUserByEmail 的 SELECT 漏 password 列（Day 4 遗留）**：邮箱登录时 `user.Password` 永远是空字符串，bcrypt 验证永远失败。修复后三个 GetUser 方法（ByPhone/ByEmail/ByID）的 SELECT 列名完全一致。
+
+4. **参数错误提示冒号后少空格**：`"参数错误:"+err.Error()` 少了个空格，跟其他 handler 的风格不统一。
+
+### 八、commit 记录（本段）
+
+```bash
+b66bec3 fix: GetUserByEmail 补充缺失的 password 列 + 新增 GetUserByID
+bf4bbee docs: jwtutil 注释补全
+7f722e8 feat: JWT 鉴权中间件——提取 Authorization header 并注入 userID
+c084007 feat: Login 返回 Access+Refresh 双 token + RefreshToken 接口
+007419b feat: GetProfile 受保护端点——从 context 取 userID 返回用户信息
+d6ece87 feat: main.go 注入 JWT + middleware——启动时 Init + /v1 受保护路由组
+```
