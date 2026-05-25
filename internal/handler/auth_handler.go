@@ -6,6 +6,7 @@ import (
 
 	"github.com/SinnerK9/my-iot-server/internal/model"
 	"github.com/SinnerK9/my-iot-server/internal/service"
+	"github.com/SinnerK9/my-iot-server/pkg/jwtutil"
 	"github.com/gin-gonic/gin"
 )
 
@@ -54,10 +55,69 @@ func Login(c *gin.Context) {
 		model.Fail(c, 5000, "服务器内部错误")
 		return
 	}
+	//新增：返回双token
+	accessToken, err := jwtutil.GenerateAccessToken(user.ID)
+	if err != nil {
+		slog.Error("GenerateAccessToken Failed", "err", err)
+		model.Fail(c, 5000, "服务器内部错误")
+		return
+	}
+	refreshToken, err := jwtutil.GenerateRefreshToken(user.ID)
+	if err != nil {
+		slog.Error("GenerateRefreshToken Failed", "err", err)
+		model.Fail(c, 5000, "服务器内部错误")
+		return
+	}
 	model.OK(c, gin.H{
-		"user_id":  user.ID,
-		"phone":    user.Phone,
-		"email":    user.Email,
-		"nickname": user.Nickname,
+		"access_token":  accessToken,
+		"refresh_token": refreshToken,
+		"token_type":    "Bearer",
+		"expires_in":    900, // 15 分钟 = 900 秒，方便前端倒计时，在将要过期时自动刷新
+		"user": gin.H{
+			"user_id":  user.ID,
+			"phone":    user.Phone,
+			"email":    user.Email,
+			"nickname": user.Nickname,
+		},
+	})
+}
+
+// 这个类只在这个函数里用一次，不需要定义到model包里
+type RefreshTokenReq struct {
+	RefreshToken string `json:"refresh_token" binding:"required"`
+}
+
+func RefreshToken(c *gin.Context) {
+	var req RefreshTokenReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		model.Fail(c, 4001, "参数错误: "+err.Error())
+		return
+	}
+	//验证refreshtoken
+	claims, err := jwtutil.ParseToken(req.RefreshToken)
+	if err != nil {
+		model.Fail(c, 4011, "Token 过期或无效")
+		return
+	}
+
+	//签发新的 Access Token并同时旋转 Refresh Token
+	newAccess, err := jwtutil.GenerateAccessToken(claims.UserID)
+	if err != nil {
+		slog.Error("GenerateAccessToken failed", "err", err)
+		model.Fail(c, 5000, "服务器内部错误")
+		return
+	}
+	newRefresh, err := jwtutil.GenerateRefreshToken(claims.UserID)
+	if err != nil {
+		slog.Error("GenerateRefreshToken failed", "err", err)
+		model.Fail(c, 5000, "服务器内部错误")
+		return
+	}
+
+	model.OK(c, gin.H{
+		"access_token":  newAccess,
+		"refresh_token": newRefresh,
+		"token_type":    "Bearer",
+		"expires_in":    900,
 	})
 }
