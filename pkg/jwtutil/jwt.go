@@ -40,7 +40,7 @@ func GenerateAccessToken(userID uint64) (string, error) {
 		},
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims) //把 Header+Payload(Claims)+Method 打包成一个 jwt.Token 对象，尚未签名
-	return token.SignedString(secret)                          //真正产生签名并拼接Token的算法
+	return token.SignedString(secret)                          //真正产生签名并拼接成整个Token的算法，payload谁都能看，但是签名只有服务器能够产生
 }
 
 func GenerateRefreshToken(userID uint64) (string, error) {
