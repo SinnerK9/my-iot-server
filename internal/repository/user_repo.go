@@ -19,7 +19,7 @@ func GetUserByPhone(phone string) (*model.User, error) {
 
 func GetUserByEmail(email string) (*model.User, error) {
 	var user model.User
-	err := DB.Get(&user, "SELECT id,phone,email,nickname,created_at,updated_at FROM users WHERE email=?", email)
+	err := DB.Get(&user, "SELECT id,phone,email,password,nickname,created_at,updated_at FROM users WHERE email=?", email)
 	if err != nil {
 		return nil, fmt.Errorf("GetUserByEmail: %w", err)
 	}
@@ -60,4 +60,13 @@ func UpdateUser(id uint64, nickname string) error {
 func DeleteUser(id uint64) error {
 	_, err := DB.Exec("DELETE FROM users WHERE id=?", id)
 	return err
+}
+
+func GetUserByID(id uint64) (*model.User, error) {
+	var user model.User
+	err := DB.Get(&user, `SELECT id,phone,email,password,nickname,created_at,updated_at FROM users WHERE id=?`, id)
+	if err != nil {
+		return nil, fmt.Errorf("GetUserByID: %w", err)
+	}
+	return &user, nil
 }
