@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/SinnerK9/my-iot-server/internal/middleware"
+	"github.com/SinnerK9/my-iot-server/pkg/jwtutil"
 	"github.com/SinnerK9/my-iot-server/internal/config"
 	"github.com/SinnerK9/my-iot-server/internal/handler"
 	"github.com/SinnerK9/my-iot-server/internal/repository"
@@ -35,11 +37,22 @@ func main() {
 	}
 	defer repository.CloseDB() //延后执行closedb
 
-	r := gin.Default()
-	r.GET("/v1/health", handler.Ping)             // 健康检查，复用已有的
-	r.POST("/v1/auth/register", handler.Register) // 注册
-	r.POST("/v1/auth/login", handler.Login)       // 登录
+	// 初始化 JWT——必须在路由注册之前调用，否则 Login 生成 token 时 secret 是 nil
+	jwtutil.Init(cfg.JWTSecret)
 
+	r := gin.Default()
+	//这部分为公开路由
+	r.GET("/v1/health", handler.Ping)                // 健康检查，复用已有的
+	r.POST("/v1/auth/register", handler.Register)    // 注册
+	r.POST("/v1/auth/login", handler.Login)          // 登录
+	r.POST("/v1/auth/refresh", handler.RefreshToken) //刷新token
+
+	//受保护路由
+	auth := r.Group("/v1") //创立路由组，组里所有路由共享/v1前缀，并且共享use(auth)
+	auth.Use(middleware.Auth())
+	{
+		auth.GET("/users/me", handler.GetProfile)
+	}
 	addr := ":" + cfg.Port
 	srv := &http.Server{
 		Addr:              addr,
