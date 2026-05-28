@@ -1115,3 +1115,123 @@ c084007 feat: Login 返回 Access+Refresh 双 token + RefreshToken 接口
 007419b feat: GetProfile 受保护端点——从 context 取 userID 返回用户信息
 d6ece87 feat: main.go 注入 JWT + middleware——启动时 Init + /v1 受保护路由组
 ```
+
+---
+
+## Week 1 Day 6 笔记：设备管理 CRUD + sqlx 事务
+
+### 一、RESTful 设备 API 设计
+
+6 个端点，URL 用名词（资源）、HTTP method 用动词（操作）：
+
+| Method | Path | 含义 |
+|---|---|---|
+| GET | `/v1/devices` | 查当前用户所有设备 |
+| POST | `/v1/devices` | 注册新设备 |
+| GET | `/v1/devices/:device_id` | 查单台设备详情 |
+| PUT | `/v1/devices/:device_id` | 修改设备名称/房间 |
+| POST | `/v1/devices/:device_id/bind` | 绑定设备（事务） |
+| DELETE | `/v1/devices/:device_id` | 解绑设备 |
+
+**RESTful vs RPC**：RPC 风格 URL 里塞动词（`/api/doCreateDevice`），RESTful 只用名词——操作类型交给 HTTP method 表达。`GET` = 读，`POST` = 新增，`PUT` = 改，`DELETE` = 删。
+
+**Gin 路径参数**：`:device_id` 在路由里是占位符，handler 里用 `c.Param("device_id")` 取值。Gin 内部用 radix tree 做路由匹配。
+
+### 二、sqlx 事务——Day 6 核心
+
+**事务解决什么问题**：两个用户同时绑定同一台设备，如果不用事务——
+
+```
+用户A 查 → owner=0 ✓          用户B 查 → owner=0 ✓（A 还没写入）
+用户A UPDATE owner=A           用户B UPDATE owner=B（覆盖了A）
+```
+
+两个人都"绑定成功"，但只有 B 真正持有——A 的绑定悄无声息被覆盖。
+
+**事务 + FOR UPDATE 怎么解决**：
+
+```go
+tx, err := DB.Beginx()          // BEGIN——事务开始
+defer tx.Rollback()             // RAII 兜底——不管怎么退出，事务一定关闭
+
+// SELECT ... FOR UPDATE：行级排他锁
+// 第一个事务锁住这行，第二个事务在这里阻塞等待
+err = tx.Get(&device, `SELECT * FROM devices WHERE device_id=? FOR UPDATE`, deviceID)
+
+if device.OwnerID != 0 {        // 第二个事务醒来后读到 owner 已不为 0
+    return 错误                  // → defer Rollback 执行
+}
+
+// 更新归属——仍在事务内
+_, err = tx.Exec(`UPDATE devices SET owner_id=?, bound_at=?, status='online' WHERE device_id=?`,
+    ownerID, now, deviceID)
+
+err = tx.Commit()               // COMMIT——释放锁，改动永久生效
+```
+
+**`defer tx.Rollback()` 模式**：Commit 成功后 Rollback 返回 `ErrTxDone`（已提交的事务不能回滚），自动忽略；中间 `return err` 时 Rollback 真正执行，撤销所有未提交改动。这对应 C++ 的 RAII——构造拿锁，析构放锁。
+
+**FOR UPDATE**：MySQL 行级排他锁（X Lock）。锁在 COMMIT/ROLLBACK 时自动释放。跨进程有效——这是分布式环境下的"mutex"。
+
+对应 C++：`std::lock_guard<std::mutex>` 保护进程内内存，FOR UPDATE 保护数据库行。
+
+### 三、归属校验——每一层各司其职
+
+三层架构里归属校验放在 **service 层**：
+
+```
+handler  → 解析请求（c.Param / c.ShouldBindJSON / getUserID）
+service → 校验"设备是否属于当前用户"——业务规则
+repo    → 纯 SQL——不关心"谁有权"
+```
+
+**为什么不在 handler 里校验**：如果 CLI 工具绕过 HTTP 直接调 repository，handler 层的校验就被跳过了。service 层是所有入口的必经之路。
+
+**GetDevice/UpdateDevice/UnbindDevice**：查设备 → `device.OwnerID != userID` → 拒绝。
+
+**BindDevice 不同**：不是"检查属于我"，而是"检查没有别人绑定"：
+```go
+if device.OwnerID != 0 && device.OwnerID != userID {
+    return errors.New("设备已被他人绑定")
+}
+```
+
+### 四、getUserID 辅助函数——DRY 原则
+
+Day 5 的 `GetProfile` 里把类型断言逻辑内联了。Day 6 有 6 个 handler 都要取 userID——
+
+```go
+func getUserID(c *gin.Context) (uint64, bool) {
+    raw, exists := c.Get("userID")
+    if !exists {
+        model.Fail(c, 4010, "未登录")
+        return 0, false
+    }
+    userID, ok := raw.(uint64)
+    if !ok {
+        slog.Error("userID 类型断言失败", "raw", raw)
+        model.Fail(c, 5000, "服务器内部错误")
+        return 0, false
+    }
+    return userID, true
+}
+```
+
+返回 `(uint64, bool)` 模式：调用方 `userID, ok := getUserID(c); if !ok { return }`。bool 为 false 时辅助函数已经写了 Fail 响应，handler 只需 return。
+
+**代码重复三次以上就应该抽函数**——这是 DRY（Don't Repeat Yourself）。
+
+### 五、本日踩的坑
+
+1. **INSERT 漏了 owner_id 字段**：`CreateDevice` 的 NamedExec 只写了 device_id/type/name/room/status 五个字段，漏了 owner_id。service 层设置了 `device.OwnerID = userID`，但 SQL 根本没插入这个值——创建后查列表为空。修复：INSERT 语句补上 `owner_id` 和 `:owner_id`。
+
+2. **BindDevice 归属检查逻辑反了**：从 GetDevice/UpdateDevice 直接复制了 `if device.OwnerID != userID`，但 BindDevice 的场景是"设备还没主人，我要做主人"——OwnerID=0 时 `0 != 5` 永远为真，每次绑定都被拒。修复：`if device.OwnerID != 0 && device.OwnerID != userID`。
+
+3. **handler 返回 error 类型**：`func ListDevices(c *gin.Context) error`——Gin handler 签名是 `func(*gin.Context)`，没有返回值。加 `error` 会导致编译失败。
+
+4. **`:=` vs `=` 混用**：同一个作用域里用 `:=` 声明了 `err`，后面再用 `err :=` 会编译报错——`:=` 要求至少有一个新变量。修复：后续用 `err =` 赋值。
+
+5. **`tx.Commit()` 返回单值却用了 `_, err =`**：Commit 只返回 `error`，不能赋给两个变量。`Exec` 返回 `(Result, error)` 才需要用 `_` 丢弃 Result。
+
+6. **UPDATE 后漏了 err 检查**：`tx.Exec` 之后直接 `tx.Commit`——如果 UPDATE 失败（数据库错误），会静默提交一个没有改动的空事务。修复：UPDATE 后加 `if err != nil { return }`。
+```
