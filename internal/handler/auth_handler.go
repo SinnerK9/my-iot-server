@@ -17,9 +17,14 @@ func isBusinessError(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "已被注册") ||
 		strings.Contains(msg, "密码错误") ||
-		strings.Contains(msg, "账号或密码错误")
+		strings.Contains(msg, "账号或密码错误") ||
+		strings.Contains(msg, "Token") ||
+		strings.Contains(msg, "设备ID已存在") || //新增设备错误
+		strings.Contains(msg, "设备不存在") ||
+		strings.Contains(msg, "无权操作") ||
+		strings.Contains(msg, "已被绑定") ||
+		strings.Contains(msg, "已被他人绑定")
 }
-
 func Register(c *gin.Context) {
 	var req model.RegisterReq
 	if err := c.ShouldBindJSON(&req); err != nil {
