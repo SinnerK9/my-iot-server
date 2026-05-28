@@ -11,3 +11,17 @@ type RegisterReq struct {
 	Password string `json:"password" binding:"required,min=8,max=20"`
 	Nickname string `json:"nickname" binding:"required,min=1,max=20"`
 }
+
+//新增设备相关请求体
+//创建设备
+type CreateDeviceReq struct{
+	DeviceID string `json:"device_id" binding:"required,min=1,max=64"`
+	Type string `json:"type" binding:"required,oneof=light aircon curtain socket"` //传入的值只能是这其中一种
+	Name string `json:"name" binding:"required,min=1,max=20"`
+	Room string `json:"room" binding:"max=20"`
+}
+
+type UpdateDeviceReq struct{
+	Name string  `json:"name" binding:"min=1,max=20"`
+	Room string `json:"room" binding:"max=20"`
+}
