@@ -11,11 +11,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/SinnerK9/my-iot-server/internal/middleware"
-	"github.com/SinnerK9/my-iot-server/pkg/jwtutil"
 	"github.com/SinnerK9/my-iot-server/internal/config"
 	"github.com/SinnerK9/my-iot-server/internal/handler"
+	"github.com/SinnerK9/my-iot-server/internal/middleware"
 	"github.com/SinnerK9/my-iot-server/internal/repository"
+	"github.com/SinnerK9/my-iot-server/pkg/jwtutil"
 	"github.com/gin-gonic/gin"
 )
 
@@ -48,10 +48,16 @@ func main() {
 	r.POST("/v1/auth/refresh", handler.RefreshToken) //刷新token
 
 	//受保护路由
-	auth := r.Group("/v1") //创立路由组，组里所有路由共享/v1前缀，并且共享use(auth)
-	auth.Use(middleware.Auth())
+	auth := r.Group("/v1")      //创立路由组，组里所有路由共享/v1前缀，并且共享use(auth)
+	auth.Use(middleware.Auth()) //Use对前面已经注册的路由不起作用
 	{
 		auth.GET("/users/me", handler.GetProfile)
+		auth.GET("/devices", handler.ListDevices)                 // 查设备列表
+		auth.POST("/devices", handler.CreateDevice)               // 注册新设备
+		auth.GET("/devices/:device_id", handler.GetDevice)        // 查单台设备
+		auth.PUT("/devices/:device_id", handler.UpdateDevice)     // 修改设备信息
+		auth.POST("/devices/:device_id/bind", handler.BindDevice) // 绑定设备（事务）
+		auth.DELETE("/devices/:device_id", handler.UnbindDevice)  // 解绑设备
 	}
 	addr := ":" + cfg.Port
 	srv := &http.Server{
