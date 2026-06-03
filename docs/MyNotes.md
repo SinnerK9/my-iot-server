@@ -1234,4 +1234,274 @@ func getUserID(c *gin.Context) (uint64, bool) {
 5. **`tx.Commit()` 返回单值却用了 `_, err =`**：Commit 只返回 `error`，不能赋给两个变量。`Exec` 返回 `(Result, error)` 才需要用 `_` 丢弃 Result。
 
 6. **UPDATE 后漏了 err 检查**：`tx.Exec` 之后直接 `tx.Commit`——如果 UPDATE 失败（数据库错误），会静默提交一个没有改动的空事务。修复：UPDATE 后加 `if err != nil { return }`。
+
+---
+
+## Week 2 Day 1 笔记：WebSocket Hub 架构设计
+
+### 一、前置知识：Socket → HTTP → WebSocket
+
+#### Socket——传输层字节管道
+
+Socket 是操作系统提供的传输层接口，只负责在网络上建立一个双向字节流管道：
+
+```cpp
+// C++：你的 WebServer 在操作的就是 Socket
+socket() → bind() → listen() → accept() → read()/write()
 ```
+
+Socket 不关心你传什么内容——HTTP 请求、你自己拼的二进制协议、还是 WebSocket 帧——Socket 只管把字节从 A 搬到 B。
+
+#### HTTP REST——建立在 Socket 上的"一问一答"协议
+
+HTTP 是在 Socket 上传送的数据格式。把 Socket 理解为电话线，HTTP 就是电话接通后说的那套"你好/请给我/再见"的对话规则。
+
+**REST 模式的特征**：请求-响应（Request-Response），**客户端必须先问**，服务器不能主动说话。
+
+```
+客户端                         服务器
+  │                              │
+  │ ──── GET /devices ────────→ │  客户端先说话
+  │ ←─── 200 {devices:[...]} ── │  服务器回应
+  │                              │
+  │  ← 没有请求时，连接沉默或关闭 →
+```
+
+#### WebSocket——同一个 Socket 上的"全双工聊天"协议
+
+WebSocket 复用同一个 TCP Socket，在 HTTP 握手后切换协议：
+
+```
+客户端                             服务器
+  │ ─── GET /ws HTTP/1.1 ────────→ │  普通 HTTP 请求
+  │     Upgrade: websocket           │  但带了这句话
+  │ ←── 101 Switching Protocols ── │  服务器同意升级
+  ═══════ HTTP 到此结束，以下都是 WebSocket 帧 ═══════
+  │ ─── {"type":"turn_on"} ───────→ │  客户端随时发
+  │ ←── {"temp":26} ────────────── │  服务器也能主动推！
+```
+
+**核心规则变化**：
+
+| | HTTP REST | WebSocket |
+|---|---|---|
+| 通信模式 | 半双工问答 | 全双工消息 |
+| 谁先说话 | 必须客户端先 | 都可以 |
+| 连接生命周期 | 一次请求/响应 → 关闭 | 持久连接 |
+| 消息格式 | HTTP header + body（几百字节） | 轻量帧（2-6 字节头） |
+| 服务器推送 | 做不到 | 这是核心用途 |
+
+### 二、Goroutine——Go 的并发执行单元
+
+**C++ 对照**：
+
+```cpp
+// C++：开线程跑 epoll 主循环
+std::thread t([&] {
+    while (is_running_) {
+        epoller_.wait(-1);  // 这件事一直在跑
+    }
+});
+t.join();
+```
+
+```go
+// Go：开 goroutine——语法几乎一样，但成本完全不是一个量级
+go func() {
+    for {
+        // 这件事一直在跑
+    }
+}()
+```
+
+| | C++ `std::thread` | Go goroutine |
+|---|---|---|
+| 创建成本 | ~1MB 栈 + 内核调度 | ~2KB 栈 + 用户态调度 |
+| 能开多少个 | 8 核 → 8 个最佳 | 几万个没问题 |
+| 切换代价 | 内核态切换，昂贵 | 用户态切换，廉价 |
+
+**关键理解**：你 C++ 里写了 `ThreadPool` 来限制线程数——因为线程太贵了不能开太多。Go 不需要 ThreadPool，goroutine 便宜到可以**每个 WebSocket 连接开两个 goroutine 伺候**（一个读、一个写）。
+
+### 三、Channel——goroutine 之间传消息的管道
+
+两个 goroutine 怎么通信？C++ 里需要 **mutex + queue + condition_variable** 三个东西配合：
+
+```cpp
+// C++：线程间通信——共享内存 + 锁
+std::queue<Task> task_queue_;
+std::mutex mtx_;
+std::condition_variable cv_;
+
+// 生产者：
+{ std::lock_guard<std::mutex> lock(mtx_); task_queue_.push(task); }
+cv_.notify_one();
+
+// 消费者：
+std::unique_lock<std::mutex> lock(mtx_);
+cv_.wait(lock, [] { return !task_queue_.empty(); });
+Task t = task_queue_.front(); task_queue_.pop();
+```
+
+上面这一大坨，Go 里就是一个 channel：
+
+```go
+ch := make(chan int)  // 创建 channel
+
+ch <- 42   // 生产者：把 42 扔进管道
+x := <-ch  // 消费者：从管道取出 42
+```
+
+**Channel 就是一个自带锁的线程安全队列**。100 个 goroutine 同时往里扔，内部已经加好锁了。
+
+**无缓冲 vs 有缓冲**：
+
+```go
+// 无缓冲 make(chan int)：发送方必须等接收方准备好
+ch := make(chan int)
+go func() { ch <- 1 }()  // 卡住，直到有人 <-ch
+
+// 有缓冲 make(chan int, 256)：可以先塞 256 个再卡住
+ch := make(chan int, 256)
+ch <- 1  // 不卡——缓冲还有空位
+ch <- 2  // 不卡
+// ... 塞满 256 个后，第 257 个卡住
+```
+
+**两条核心规则**：
+- 发送方阻塞：如果管道满了，`ch <- x` 会卡住直到有人取走
+- 接收方阻塞：如果管道空了，`<-ch` 会卡住直到有人放进来
+
+### 四、Hub 模式——WebSocket 版的 Epoller
+
+**你的 C++ WebServer 架构**：有一个"主控室"——while 循环——盯着所有 fd，有事情发生了就分派处理。
+
+```cpp
+while (is_running_) {
+    int n = epoller_.wait(-1);   // ← 主循环：等事件
+    for (int i = 0; i < n; i++) {
+        int fd = epoller_.get_fd(i);
+        if (fd == listen_fd_)    handle_listen_();  // 新连接
+        else if (EPOLLIN)        handle_read_(fd);  // 有数据
+        else if (EPOLLOUT)       handle_write_(fd); // 能写了
+        else if (EPOLLRDHUP)     handle_close_(fd); // 断了
+    }
+}
+```
+
+**Go Hub 是同样的思想，但工具变了**：
+
+| C++ 工具 | Go 工具 |
+|---|---|
+| epoll（事件通知） | channel（消息通知） |
+| ThreadPool（任务分发） | goroutine（任务执行） |
+| 锁（保护共享数据） | 不需锁（channel 自带安全） |
+
+**Hub 结构体的翻译**：
+
+```go
+type Hub struct {
+    clients    map[uint64]*Client  // 对应 users_[MAX_FD]
+    register   chan *Client        // "有新连接来了"通道
+    unregister chan *Client        // "有连接断了"通道
+}
+```
+
+**主循环对照**：
+
+| C++ Epoller 主循环 | Go Hub.run() |
+|---|---|
+| `epoller_.wait(-1)` 阻塞等事件 | `select { case <-ch: }` 阻塞等 channel 消息 |
+| 新 fd → `users_[fd] = newConn` | `<-h.register` → `clients[id] = c` |
+| fd 断开 → `close(fd)` + 清理 | `<-h.unregister` → `delete(clients)` + `close(send)` |
+| `std::thread([&]{ reactor }).detach()` | `go h.run()` |
+
+**为什么用 channel 而不是直接加锁写 map**：
+
+Go 的经典模式：**"Share memory by communicating"**（通过通信来共享内存，而不是通过共享内存来通信）。
+
+Hub.run() 是**唯一**读写 clients map 的 goroutine——没有竞态条件，根本不需要锁。所有对 map 的操作通过 channel 发给 run()，run() 串行处理。
+
+### 五、Client 结构体——每个连接的状态
+
+```go
+type Client struct {
+    Hub    *Hub           // 所属 Hub——广播时需要
+    Conn   *websocket.Conn // 底层 WebSocket 连接
+    Send   chan []byte    // 缓冲 channel（256）——消息队列
+    UserID uint64         // 这个连接属于谁
+}
+```
+
+**Send chan 为什么存在——核心设计决策**：
+
+gorilla/websocket 的 WriteMessage **不支持并发调用**。但多个 goroutine 可能都要给同一个客户端发消息：
+- Hub 广播 → 需要写 Conn
+- 心跳 ping → 需要写 Conn
+- Handler 定向推送 → 需要写 Conn
+
+**Send chan 的解决方案**：所有想给客户端发消息的人，**不直接写 Conn**，而是往 Send channel 里扔消息。**只有一个 goroutine（writePump）在消费 Send channel**——串行写入 Conn。
+
+```
+多个生产者                      一个消费者
+Hub 广播 ──→ Send ←──writePump──→ Conn.WriteMessage()
+心跳 ping ──→  ch   (唯一的写 goroutine)
+定向推送 ──→      |
+              buffered (256)
+```
+
+**C++ 对照**：你的 HttpConn 里的 `write_queue_`——epoll 在 fd 可写时从队列取数据写入——就是 Send chan 的等价位。
+
+**为什么 Send 带缓冲（256）**：如果没有缓冲，外部 goroutine 发消息会阻塞等 writePump 取走。writePump 写网卡很慢（ms 级），这期间外部 goroutine 白白等着。有 256 个缓冲位，外部扔进去就走——这叫**削峰填谷**。
+
+### 六、每个 Client 的两个 Goroutine
+
+Go 的 WebSocket 库规定读写必须在不同 goroutine——ReadMessage() 是阻塞的，读写同 goroutine 会互相卡住。
+
+```
+Client 连上了
+    │
+    ├── go readPump()   负责：conn.ReadMessage() 循环读
+    │                    收到消息 → Hub 广播
+    │
+    └── go writePump()  负责：从 Send chan 取消息 → conn.WriteMessage()
+                         多个地方都往 Send chan 扔，writePump 串行写出
+```
+
+| Goroutine | C++ 对照 | 职责 |
+|---|---|---|
+| readPump | `handle_read(fd)` | 循环读消息，心跳检测 |
+| writePump | `handle_write(fd)` | 从 Send chan 取消息，串行写入连接 |
+
+### 七、一个连接从生到死
+
+```
+1. 浏览器发起 WebSocket 连接
+   ↓
+2. Gin handler 调用 upgrader.Upgrade(w, r) → HTTP 升级成 WebSocket
+   ↓
+3. 创建 Client{ Hub, Conn, Send(make(chan []byte, 256)), UserID }
+   ↓
+4. go client.readPump()  +  go client.writePump()
+   ↓
+5. hub.Register <- client  →  Hub.run() 收到 → 写入 clients map
+   ↓
+6. 连接存续期：readPump 循环读，writePump 循环写，心跳保活
+   ↓
+7. 连接断开（超时/关标签页/网络断）：
+   readPump 的 ReadMessage 返回 error
+   → defer: hub.Unregister <- client
+   → Hub.run(): delete(clients, id) + close(client.Send)
+   → close(Send) 后 writePump 的 range Send 退出
+   → writePump defer: conn.Close()
+   → 两个 goroutine 都退出，连接完全清理
+```
+
+**关键安全点**：`close(client.Send)` 必须在 Hub.run() 的 unregister case 里执行、且已经从 map 删除之后。如果在 readPump 里直接 close，会和 writePump 的 `range Send` 产生竞态 panic。
+
+### 八、本日踩的坑
+
+1. **client.go 的 import 格式错误**：写了 `import{` 少了一个空格——Go 要求 `import (` 左括号前必须有空格。修复：`import (`。
+
+2. **channel 方向和 make 语法混淆**：`Send chan[]byte` 写成了 `Send chan []byte` 中间缺少空格——`chan` 是类型前缀，后面跟元素类型。正确：`Send chan []byte`。
+
+3. **对 Hub/Channel/Goroutine 的名词恐惧**：这三个概念其实都是 C++ 里已有概念的 Go 版本——Hub = Epoller 主循环，Channel = mutex+queue+cv，Goroutine = 轻量线程。不需要想得太复杂，本质上就是"事件循环 + 消息队列 + 工作线程"的另一种写法。

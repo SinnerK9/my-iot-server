@@ -1,10 +1,10 @@
 package websocket
 
-import{
-	"fmt"
+import (
 	"time"
+
 	"github.com/gorilla/websocket"
-}
+)
 
 const(
 	writeWait = 10* time.Second  // 写超时，向客户端发消息最多等 10 秒
