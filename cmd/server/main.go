@@ -15,6 +15,7 @@ import (
 	"github.com/SinnerK9/my-iot-server/internal/handler"
 	"github.com/SinnerK9/my-iot-server/internal/middleware"
 	"github.com/SinnerK9/my-iot-server/internal/repository"
+	ws "github.com/SinnerK9/my-iot-server/internal/websocket"
 	"github.com/SinnerK9/my-iot-server/pkg/jwtutil"
 	"github.com/gin-gonic/gin"
 )
@@ -40,6 +41,9 @@ func main() {
 	// 初始化 JWT——必须在路由注册之前调用，否则 Login 生成 token 时 secret 是 nil
 	jwtutil.Init(cfg.JWTSecret)
 
+	//初始化HUB
+	hub := ws.NewHub()
+	hub.Start()
 	r := gin.Default()
 	//这部分为公开路由
 	r.GET("/v1/health", handler.Ping)                // 健康检查，复用已有的
