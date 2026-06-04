@@ -1505,3 +1505,146 @@ Client 连上了
 2. **channel 方向和 make 语法混淆**：`Send chan[]byte` 写成了 `Send chan []byte` 中间缺少空格——`chan` 是类型前缀，后面跟元素类型。正确：`Send chan []byte`。
 
 3. **对 Hub/Channel/Goroutine 的名词恐惧**：这三个概念其实都是 C++ 里已有概念的 Go 版本——Hub = Epoller 主循环，Channel = mutex+queue+cv，Goroutine = 轻量线程。不需要想得太复杂，本质上就是"事件循环 + 消息队列 + 工作线程"的另一种写法。
+
+---
+
+## Week 2 Day 2 笔记：Hub.Run() 事件循环 + Broadcast + SendToUser
+
+### 一、Day 2 做了什么
+
+Day 1 搭了 Hub + Client 的结构体骨架，`run()` 是空壳。Day 2 把 `run()` 填满——一个完整的三路事件循环，外加一个定向推送方法。
+
+改动集中在 `internal/websocket/hub.go`：
+- Hub struct 加 `Broadcast chan []byte`
+- `run()` 填满：register / unregister / broadcast 三个 case
+- 新增 `SendToUser()` —— 给指定用户发消息
+
+### 二、run()——三路 select 事件循环
+
+```go
+func (h *Hub) run() {
+    for {
+        select {
+        case client := <-h.Register:      // 事件1：新连接上线
+        case client := <-h.Unregister:    // 事件2：连接断开
+        case msg := <-h.Broadcast:        // 事件3：广播消息
+        }
+    }
+}
+```
+
+**C++ 对照**：
+
+```
+Go:  for { select { case <-ch1: case <-ch2: case <-ch3: } }
+C++: while(is_running_) {
+         epoller_.wait(-1);
+         for(i in n) dispatch(fd, events);  // EPOLLIN→读 / EPOLLOUT→写 / RDHUP→断
+     }
+```
+
+都是单线程事件循环——一个 goroutine 串行处理所有事件。区别是你 Reactor 按 **fd + epoll event** 分发，Hub 按 **channel 类型**分发。
+
+### 三、Register case——新连接上线
+
+```go
+case client := <-h.Register:
+    h.Mu.Lock()
+    h.Clients[client.UserID] = client
+    h.Mu.Unlock()
+```
+
+没什么花活——加锁、写 map、解锁。`Lock()` 用排他锁因为写 map。
+
+### 四、⭐ Unregister case——断开连接，三段安全保护
+
+这是 Day 2 最重要的设计决策，我自己写的注释里重点标了：
+
+```go
+case client := <-h.Unregister:
+    h.Mu.Lock()
+    // 安全检查①：只判断 userID 不够，必须同时判断指针
+    if existing, ok := h.Clients[client.UserID]; ok && existing == client {
+        // 安全检查②：先 delete 再 close——顺序不能反
+        delete(h.Clients, client.UserID)
+        close(client.Send)
+    }
+    h.Mu.Unlock()
+```
+
+**安全检查①：`existing == client`——为什么只判断 userID 不够？**
+
+同一个用户重新连接（刷新页面）时，新 Client 覆盖了 map 里的旧 Client。旧 Client 的 goroutine 随后注销——走到 unregister case 时，map 里的 `Clients[userID]` 已经指向**新** Client 了。
+
+如果只判断 `ok`（key 存在），就会错误地把新 Client 从 map 删掉、close 掉新 Client 的 Send chan——新连接莫名其妙断了。
+
+`existing == client` 做**指针比较**：注销的必须是 map 里当前存的那个对象。旧 Client 和新 Client 是不同的指针——`&Client{...} != &Client{...}`——即使 userID 相同。所以旧 Client 注销时会发现"map 里存的不是我了"，跳过删除，新连接不受影响。
+
+**安全检查②：`delete(map)` 必须在 `close(channel)` 之前**
+
+```
+正确顺序：
+  delete(h.Clients, userID)   // ① 先从 map 移除——broadcast 再遍历不到它了
+  close(client.Send)           // ② 再关 channel——writePump 安全退出
+
+错误顺序（如果在 readPump 里 close）：
+  readPump goroutine: close(client.Send)     // 关 channel
+  Hub.broadcast goroutine: client.Send <- msg // ← 同时发生！panic: send on closed channel
+```
+
+**规则**：`close(ch)` 必须由**唯一写入方**执行。Send chan 的唯一写入方是 `Hub.run()`（通过 broadcast 和 SendToUser）。在 unregister case 里，`delete` 先执行保证了没有后续写入，然后 `close` 安全执行。
+
+### 五、⭐ Broadcast case——非阻塞发送 + 读写锁
+
+```go
+case msg := <-h.Broadcast:
+    h.Mu.RLock()                        // 读锁——允许多个 broadcast 同时遍历
+    for _, client := range h.Clients {
+        select {
+        case client.Send <- msg:         // 发送成功
+        default:                         // ⭐ Send chan 满了——跳过，不阻塞
+        }
+    }
+    h.Mu.RUnlock()
+```
+
+**`select default` 为什么不能省略？**
+
+如果写成 `client.Send <- msg`（没有 select default），当某个客户端的 Send chan 缓冲满了（256 条积压），这条语句会**永久阻塞**。而它又持有 `h.Mu.RLock()`——Register 和 Unregister 都在等 `h.Mu.Lock()`——整个 Hub 死锁。
+
+`select default` = "发不了就算了"——宁可丢一条广播消息给慢客户端，也不能拖死整个 Hub。
+
+**RLock vs Lock**：
+
+| 操作 | 锁 | 理由 |
+|---|---|---|
+| Register（写 map） | `Lock()` | 独占 |
+| Unregister（写 map + close） | `Lock()` | 独占 |
+| Broadcast（遍历读 map） | `RLock()` | 共享——多个 goroutine 可以同时读 |
+| SendToUser（查一个 client） | `RLock()` | 共享 |
+
+对应 C++：`shared_lock` vs `unique_lock`，原理完全一样。
+
+### 六、SendToUser——定向推送
+
+```go
+func (h *Hub) SendToUser(userID uint64, msg []byte) {
+    h.Mu.RLock()
+    client, ok := h.Clients[userID]
+    h.Mu.RUnlock()
+    if ok {
+        select {
+        case client.Send <- msg:
+        default:  // 同样非阻塞——不拖死调用方
+        }
+    }
+}
+```
+
+和 Broadcast 的区别：Broadcast 遍历所有 Client，SendToUser 只找一个。Week 3 设备状态推送时用——设备状态变了，只通知设备 owner，不是全站广播。
+
+锁的粒度很关键：`RLock` 只在查 map 时持有——查到 client 指针后立即 `RUnlock`，然后无锁状态下往 Send chan 发消息。如果发消息时还持着锁，慢客户端会连带拖住其他 SendToUser 调用者。
+
+### 七、今天踩的坑
+
+1. **SendToUser 漏了 receiver**：第一版写成了 `func SendToUser(userID uint64, msg []byte)` 没有 `(h *Hub)`。函数体内用了 `h.Mu.RLock()`——编译器报 `undefined: h`。Go 的方法必须声明它属于哪个类型。修复：`func (h *Hub) SendToUser(...)`。
