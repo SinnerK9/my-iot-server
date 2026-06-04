@@ -25,6 +25,9 @@ type Hub struct {
 	// Unregister 是"下线"通知 channel。
 	// Client 断开后把自己发到这个 channel → Hub.Run() 收到后从 Clients map 删除。
 	Unregister chan *Client
+
+	//新增，用于给所有在线客户端广播消息
+	Broadcast chan []byte
 }
 
 // NewHub 创建并返回 Hub 实例。
@@ -35,6 +38,7 @@ func NewHub() *Hub {
 		Clients:    make(map[uint64]*Client),
 		Register:   make(chan *Client),
 		Unregister: make(chan *Client),
+		Broadcast:  make(chan []byte),
 	}
 }
 
@@ -48,10 +52,52 @@ func (h *Hub) Start() {
 func (h *Hub) run() {
 	for {
 		select {
+		//情况1：新客户端上线
 		case client := <-h.Register:
+			h.Mu.Lock() //保护并发读写，Clients在多个goroutine里写，必须加锁
+			h.Clients[client.UserID] = client
+			h.Mu.Unlock()
+			slog.Info("client registered", "userID", client.UserID)
 
+		//情况2：客户端断开，从注销通道里取出一个client
 		case client := <-h.Unregister:
+			h.Mu.Lock()
+			//检查发现client在map里：注意，只判断userID不够，因为可能出现同id的新旧连接问题
+			if existing, ok := h.Clients[client.UserID]; ok && existing == client {
+				delete(h.Clients, client.UserID)
+				close(client.Send)
+				//close必须在delete之后
+				//单纯close后chan无法再写入，但是尚未delete之前广播可能尝试访问client
+				//一旦在此时访问client会尝试往已经关闭的chan里写东西，会导致panic
+			}
+			h.Mu.Unlock()
+			slog.Info("client unregistered", "userID", client.UserID)
 
+		case msg := <-h.Broadcast:
+			h.Mu.RLock()
+			for _, client := range h.Clients {
+				//select + default进行非阻塞发送
+				//一旦某个client的Send Chan满了不会导致堵塞，而是跳过之
+				select {
+				case client.Send <- msg:
+					//发送成功情况
+				default:
+					//Send chan满了，跳过
+				}
+			}
+			h.Mu.RUnlock()
+		}
+	}
+}
+
+func (h *Hub) SendToUser(userID uint64, msg []byte) {
+	h.Mu.RLock()
+	client, ok := h.Clients[userID]
+	h.Mu.RUnlock()
+	if ok {
+		select {
+		case client.Send <- msg:
+		default:
 		}
 	}
 }
