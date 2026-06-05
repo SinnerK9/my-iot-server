@@ -62,6 +62,7 @@ func main() {
 		auth.PUT("/devices/:device_id", handler.UpdateDevice)     // 修改设备信息
 		auth.POST("/devices/:device_id/bind", handler.BindDevice) // 绑定设备（事务）
 		auth.DELETE("/devices/:device_id", handler.UnbindDevice)  // 解绑设备
+		auth.GET("/ws", handler.WsHandler(hub))                   //新增，升级前必须先验证JWT
 	}
 	addr := ":" + cfg.Port
 	srv := &http.Server{

@@ -20,3 +20,15 @@ type Client struct{
 	Send chan[]byte //缓冲channel，负责将消息传给writepump
 	UserID uint64 //用于鉴别这个连接属于的用户
 }
+
+// NewClient 创建 Client 实例。
+// 写构造函数而非让调用方手拼 &Client{...}，防止漏掉 make channel，
+// 导致向 nil channel 发送消息从而永久阻塞。
+func NewClient(hub *Hub, conn *websocket.Conn, userID uint64) *Client {
+	return &Client{
+		Hub:    hub,
+		Conn:   conn,
+		Send:   make(chan []byte, 256),
+		UserID: userID,
+	}
+}
