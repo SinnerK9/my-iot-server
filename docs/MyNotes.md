@@ -1648,3 +1648,78 @@ func (h *Hub) SendToUser(userID uint64, msg []byte) {
 ### 七、今天踩的坑
 
 1. **SendToUser 漏了 receiver**：第一版写成了 `func SendToUser(userID uint64, msg []byte)` 没有 `(h *Hub)`。函数体内用了 `h.Mu.RLock()`——编译器报 `undefined: h`。Go 的方法必须声明它属于哪个类型。修复：`func (h *Hub) SendToUser(...)`。
+
+### 八、Day 2 收尾：NewClient + WsHandler + main.go
+
+**NewClient 构造函数**：
+
+```go
+func NewClient(hub *Hub, conn *websocket.Conn, userID uint64) *Client {
+    return &Client{
+        Hub:    hub,
+        Conn:   conn,
+        Send:   make(chan []byte, 256),
+        UserID: userID,
+    }
+}
+```
+
+为什么写构造函数：Send chan 必须 `make` 初始化——channel 的零值是 nil，往 nil channel 发消息永久阻塞。让调用方手拼 `&Client{...}` 早晚有人漏掉 make。构造函数把这个细节封死。
+
+**WsHandler——HTTP 升级为 WebSocket 的入口**：
+
+```go
+func WsHandler(hub *ws.Hub) gin.HandlerFunc {
+    return func(c *gin.Context) {
+        conn, _ := upgrader.Upgrade(c.Writer, c.Request, nil)
+        userID, _ := getUserID(c)
+        client := ws.NewClient(hub, conn, userID)
+        hub.Register <- client
+    }
+}
+```
+
+**闭包模式**：外半层 `func WsHandler(hub)` 在 main.go 启动时调一次，返回的函数"记住"了 hub。内半层 `func(c *gin.Context)` 每次 WS 请求时 Gin 调一次，拿到这次请求的信封 c。
+
+对应 C++：`auto handler = [hub](Request* c) { ... }`——lambda 捕获。
+
+**main.go 路由**：`auth.GET("/ws", handler.WsHandler(hub))`。放在受保护路由组里——WS 升级前 Auth 中间件先验 JWT，通过后才走 WsHandler。
+
+### 九、容器全景——系统里到底有几个"装东西的容器"
+
+被搞晕的核心原因：多个容器在各层之间传递数据，搞不清谁存什么、谁认识谁。逐个拆开：
+
+| 容器 | 层 | 生命周期 | 存什么 | userID 在上面吗 |
+|---|---|---|---|---|
+| `c *gin.Context` | HTTP 层 | 一次请求（微秒~毫秒） | Request/Writer + Keys map | **临时暂存**：`c.Keys["userID"]=1` |
+| `*ws.Hub` | WebSocket 层 | 进程生命周期 | Clients map 让找所有在线用户 | **间接**：`Clients[1]` 的 key 就是 userID |
+| `*ws.Client` | WebSocket 层 | 连接生命周期（秒~小时） | Conn 指针 + Send chan + UserID 字段 | **永久刻在 struct 里**：`Client.UserID=1` |
+| `*websocket.Conn` | 传输层 | 同 Client | TCP socket + 读写缓冲 | 没有——它只管收发字节 |
+| `model.User` | 数据层 | 用完即弃（微秒） | 数据库行映射 | **有**：`User.ID=1`（但这是数据库字段，和连接无关） |
+
+**userID 的传递链**：
+
+```
+JWT Payload  →  Auth 中间件解析  →  c.Set("userID", 1)  →  Gin 信封暂存
+                                              ↓
+                                   WsHandler: c.Get("userID")
+                                              ↓
+                                   NewClient(hub, conn, 1)
+                                              ↓
+                                   Client.UserID = 1  ← 刻进 struct，信封销毁也不丢
+                                              ↓
+                                   Hub.Clients[1] = client  ← map 的 key
+```
+
+**各层之间的隔离**：
+
+- Hub 不认识 Gin，不知道什么叫 HTTP 请求
+- Gin 不认识 Hub，不知道什么叫 WebSocket 广播
+- Client 是桥梁——同时持有 Hub 指针和 Conn 指针，连通两层
+- model.User 孤立存在——不认识任何连接
+
+**为什么需要双向引用**：Hub → Client（broadcast 遍历 map 找到人），Client → Hub（断开时 Unregister 发到 Hub 的 channel）。
+
+### 十、Day 2 收尾踩的坑
+
+1. **NewClient 漏了 `return` 关键字**：写成了 `func NewClient(...) *Client{ Hub: hub, ... }`，没有 `return &Client{...}`。Go 的 struct 字面量必须包在 return 语句里——它不会像 Rust 那样自动把最后一行当返回值。编译器报语法错误。
