@@ -36,6 +36,10 @@ func WsHandler(hub *ws.Hub) gin.HandlerFunc {
 		//创建新client并将其注册到hub
 		client := ws.NewClient(hub, conn, userID)
 		hub.Register <- client
+		//Register后启动读写协程
+		//两个goroutine都是阻塞的，readpump在Readmessage上，writePump在select上
+		go client.ReadPump()
+		go client.WritePump()
 		slog.Info("ws connected", "userID", userID)
 	}
 }
