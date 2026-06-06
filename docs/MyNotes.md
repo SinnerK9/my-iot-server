@@ -1723,3 +1723,150 @@ JWT Payload  →  Auth 中间件解析  →  c.Set("userID", 1)  →  Gin 信封
 ### 十、Day 2 收尾踩的坑
 
 1. **NewClient 漏了 `return` 关键字**：写成了 `func NewClient(...) *Client{ Hub: hub, ... }`，没有 `return &Client{...}`。Go 的 struct 字面量必须包在 return 语句里——它不会像 Rust 那样自动把最后一行当返回值。编译器报语法错误。
+
+## W2D3 笔记——readPump + writePump：每个 Client 的两个 goroutine
+
+### 一、Day 3 之前 vs 之后
+
+Day 2 结束时：Client 创建好了、注册进 Hub 的 map 了。但没有人读 Conn、没有人写 Conn。Client 像一把空椅子塞在 map 里。
+
+Day 3：给每个 Client 配上两个 goroutine：
+
+```
+┌──── Client ────┐
+│ readPump       │  ← 阻塞在 ReadMessage，收到消息 → Broadcast
+│ writePump      │  ← 阻塞在 select，从 Send 取消息 → WriteMessage
+└────────────────┘
+```
+
+C++ 对照：你的 Reactor 里每个 fd 有 EPOLLIN 和 EPOLLOUT 两个事件。readPump = 处理 EPOLLIN 的 goroutine，writePump = 处理 EPOLLOUT 的 goroutine。区别：C++ 用 epoll_wait 同时等所有 fd，Go 让每个连接自己阻塞等——goroutine 阻塞不占 CPU 线程。
+
+### 二、readPump——唯一的读者
+
+```go
+func (c *Client) ReadPump() {
+    defer func() {
+        c.Hub.Unregister <- c  // 通知 Hub 清理
+        c.Conn.Close()
+    }()
+
+    c.Conn.SetReadDeadline(time.Now().Add(pongWait))  // 60s
+    c.Conn.SetPongHandler(func(string) error {
+        c.Conn.SetReadDeadline(time.Now().Add(pongWait))  // 续命
+        return nil
+    })
+
+    for {
+        _, msg, err := c.Conn.ReadMessage()  // 阻塞等
+        if err != nil { break }              // → defer 清理
+        c.Hub.Broadcast <- msg
+    }
+}
+```
+
+**SetReadDeadline 的作用**：不是 TCP keepalive，是 gorilla 应用层的超时。如果 60 秒内 ReadMessage 没读到任何东西（包括 Pong 帧），返回 timeout error。这防止客户端网络断开但不发 close frame 时连接永远不被回收。
+
+**PongHandler 怎么续命**：writePump 每 54 秒发一次 Ping → 客户端浏览器自动回 Pong → gorilla 收到 Pong → 调 PongHandler → SetReadDeadline(now + 60s)。只要客户端活着，deadline 就被不断往后推。
+
+**defer 里的 Unregister**：readPump 正常或异常退出 → defer 发 Unregister 给 Hub → Hub.run() 做 delete + close(Send)。**readPump 不自己 close(Send)**——这是 Hub 架构的铁律。
+
+### 三、writePump——唯一的写者 + 心跳发生器
+
+```go
+func (c *Client) WritePump() {
+    ticker := time.NewTicker(pingPeriod)  // 54s 定时
+    defer func() {
+        ticker.Stop()
+        c.Conn.Close()
+    }()
+
+    for {
+        select {
+        case msg, ok := <-c.Send:
+            if !ok {
+                // Send channel 被关了 → Hub 通知我退出
+                c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
+                return
+            }
+            c.Conn.WriteMessage(websocket.TextMessage, msg)
+
+        case <-ticker.C:
+            c.Conn.WriteMessage(websocket.PingMessage, nil)
+        }
+    }
+}
+```
+
+**为什么需要一个专门的写 goroutine**：gorilla/websocket 的 WriteMessage 不支持并发调用。但发消息的来源很多——Broadcast、SendToUser、心跳 Ping。这些"想写"的人不能直接调 WriteMessage，而是往 Send channel 里塞消息。writePump 是唯一消费 Send channel 的 goroutine，把所有并发写串行化。
+
+这就是你的 C++ WebServer 里 write_queue_ + EPOLLOUT 模式的 Go 版本——**把并发写变成排队写**。
+
+### 四、心跳周期——54 和 60 的关系
+
+```
+pingPeriod = (pongWait * 9) / 10 = 54s
+
+时间线：
+0s ──── 54s(Ping) ──── 60s(Deadline) ──── 108s(Ping) ──── 120s(Deadline)
+         ↓                          ↓
+    54s Ping 发出              如果 54s 的 Ping 没有 Pong 回来，
+    → 浏览器回 Pong             6s 后（60s deadline 到期）→ 连接断开
+    → PongHandler 续命到 114s  留 6s = 一次网络丢包 + 客户端处理时间
+```
+
+如果 `pingPeriod >= pongWait`，Ping 发出去之前 Deadline 已经到期——连接会被误杀。
+
+### 五、完整生命周期全景
+
+```
+① 连接建立
+   GET /v1/ws (带 JWT) → Auth 中间件 → c.Set("userID")
+   → upgrader.Upgrade() → HTTP → WebSocket
+   → NewClient(hub, conn, userID)
+   → hub.Register <- client
+   → go ReadPump() + go WritePump()
+
+② 正常运行
+   writePump: 每 54s 发 Ping → 浏览器回 Pong → PongHandler 续命
+   readPump: ReadMessage 阻塞 → 收到消息 → Broadcast → Hub.run() 遍历分发
+
+③ 断开（三种触发）
+   A. 浏览器关闭 → ReadMessage 返回 close error → break
+   B. 网络断开 → 54s Ping 无响应 → 60s Deadline 到期 → ReadMessage timeout → break
+   C. 服务端主动踢 → Hub.Unregister <- client
+
+④ 清理链
+   readPump defer → Hub.Unregister <- client
+   → Hub.run() unregister case → Lock → delete(map) → close(Send) → Unlock
+   → writePump: range Send 读到关闭 → WriteMessage(CloseMessage) → return
+   → 两个 goroutine 退出 → conn.Close() → 零泄漏
+```
+
+### 六、Send chan 到底谁在把控？
+
+| 操作 | 谁做 | 在哪 |
+|---|---|---|
+| 创建 make | NewClient | ws_handler.go |
+| 写消息 | Hub.run() 的 Broadcast case + SendToUser | hub.go |
+| **关 close** | **Hub.run() Unregister case** | hub.go |
+| 消费 | writePump 的 `range Send` | client.go |
+| 退出检测 | writePump 的 `!ok` | client.go |
+
+创建和关闭都是 Hub.run() 说了算。readPump 只负责发 Unregister 通知——**它不开不关** Send。这就是 "写入方关闭 channel" 的 Go 惯例——Hub.run() 是唯一的写入者（代表所有人写），所以只有它能关。
+
+### 七、C++ ↔ Go 对照（new）
+
+| C++ WebServer | Go Hub |
+|---|---|
+| Epoller 管理所有 fd，epoll_wait 阻塞等事件 | Hub.run() goroutine，select 阻塞等 channel |
+| 每个 fd 有 EPOLLIN / EPOLLOUT | 每个 Client 有 readPump / writePump |
+| SO_RCVTIMEO socket 选项防死连接 | SetReadDeadline + Ping/Pong 应用层心跳 |
+| write_queue_ + mutex → EPOLLOUT 时 write() | Send chan → writePump WriteMessage() |
+| ThreadPool 多个 worker → 都往 write_queue_ 推 | Hub.run() 一个 goroutine → 往 Send chan 推 |
+| close(fd) + 设置 done_ 标志通知 worker | close(Send) → writePump !ok 退出 |
+
+### 八、Day 3 踩坑
+
+1. **gofmt 格式化**：`const(` 后面括号不空格、`type struct{` 大括号前空格——gofmt 全部帮你修好了。Go 的格式不是风格问题，是强制执行。
+
+2. **`websocket.IsUnexpectedCloseError` 的参数**：传入 CloseGoingAway(1001) 和 CloseNormalClosure(1000)，表示"这两个是预期中的关闭，不要给我记 error 日志"。其他 code（如 1006 异常）会触发 Error 日志。
