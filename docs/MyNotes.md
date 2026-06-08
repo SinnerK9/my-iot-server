@@ -1870,3 +1870,221 @@ pingPeriod = (pongWait * 9) / 10 = 54s
 1. **gofmt 格式化**：`const(` 后面括号不空格、`type struct{` 大括号前空格——gofmt 全部帮你修好了。Go 的格式不是风格问题，是强制执行。
 
 2. **`websocket.IsUnexpectedCloseError` 的参数**：传入 CloseGoingAway(1001) 和 CloseNormalClosure(1000)，表示"这两个是预期中的关闭，不要给我记 error 日志"。其他 code（如 1006 异常）会触发 Error 日志。
+
+---
+
+## W2D4 笔记——Hub 联调：浏览器链路 + 鉴权改造 + 连接覆盖 Bug 修复
+
+### 一、Day 4 到底做了什么
+
+Day 1-3 搭起了 Hub + readPump + writePump 的完整架构。Day 4 是联调日——写 mock.html 让浏览器连上 WS，验证广播、心跳、断开清理。但一连线就出了三个问题，每个都牵出一层架构理解。
+
+### 二、问题一：浏览器 WebSocket 不支持自定义 Header
+
+**现象**：mock.html 里 `new WebSocket("ws://localhost:7777/v1/ws?token=xxx")`，服务器收到后 Auth 中间件拦截，返回 4010 "未登录"。
+
+**根因**：`new WebSocket()` 只接受 URL 字符串——没有 headers 参数。浏览器自动填 Upgrade/Connection/Sec-WebSocket-Key 等 WS 必需的 Header，但**不让你加自定义的**。`Authorization` header 不存在 → Auth 中间件 `c.GetHeader("Authorization")` 返回空 → `c.Abort()`。
+
+这不是 WebSocket 协议的问题——协议本身允许自定义 Header。这是**浏览器 API 的限制**——`WebSocket` 构造函数的设计就没给你留传 headers 的口子。
+
+**对比**：
+
+```
+fetch() — REST API：
+  fetch(url, { headers: { Authorization: 'Bearer xxx' } })
+  → 可以随便设 Header → token 在 Header 里
+
+new WebSocket() — 浏览器 WS：
+  new WebSocket("ws://host/ws?token=xxx")
+  → 只能传 URL → token 只能在 URL 里
+```
+
+**修法**：WS 路由从 auth 组移出，WsHandler 自己从 URL 解析 token：
+
+```go
+// main.go — 移出 auth 组
+r.GET("/v1/ws", handler.WsHandler(hub))  // 不是 auth.GET
+
+// ws_handler.go — 自己验 JWT
+token := c.Query("token")           // 从 URL 读
+claims, _ := jwtutil.ParseToken(token)  // 自己验
+userID = claims.UserID
+```
+
+**REST vs WS 鉴权路径对比**：
+
+```
+REST API：
+  fetch → Authorization header → Auth 中间件(c.GetHeader) → c.Set("userID") → handler
+
+WebSocket：
+  new WebSocket(url?token=) → WsHandler(c.Query) → jwtutil.ParseToken → userID
+```
+
+两条路读完都是调同一个 `jwtutil.ParseToken()`——token 从哪来（Header 还是 URL）对解析函数来说完全一样。
+
+### 三、问题二：upgrade 后 connection hijacked panic
+
+**现象**：连接成功（浏览器 onopen 触发），但立刻断开（1006）。服务器日志：`Error #01: http: connection has been hijacked`。
+
+**根因链路**：
+
+```go
+func WsHandler(hub *ws.Hub) gin.HandlerFunc {
+    return func(c *gin.Context) {
+        token := c.Query("token")          // ① 读到 token
+        userID = 1                          // ② 解析成功
+
+        conn, _ := upgrader.Upgrade(...)   // ③ TCP 被接管（hijack）
+        // ↑ 此刻 c.Writer 底层连接已被 gorilla 拿走
+        //   再往 c.Writer 写任何东西 → panic
+
+        userID, ok := getUserID(c)          // ④ 问题在这里！
+        // ↑ Auth 中间件没跑（路由在 auth 组外）
+        //   c.Get("userID") 不存在 → ok=false
+        if !ok {
+            conn.Close()                    // ⑤ 关 WS 连接
+            return                          // ⑥ 还给 Gin
+        }
+    }
+}
+```
+
+⑥ `return` 之后：Gin 的 Logger 中间件想记录响应状态码 → 调 `c.Writer.WriteHeader()` → 底层连接已被接管 → Go 标准库检测到 → panic: http: connection has been hijacked → Gin Recovery 捕获 → 尝试写 500 错误 → 又往已接管的连接写 → 日志输出 "Error #01"。
+
+**时间线**：
+
+```
+浏览器                                  服务器
+  GET /v1/ws?token=eyJ...
+  ─────────────────────────────────→  upgrader.Upgrade() ← TCP hijack
+  ←── 101 Switching Protocols ────   WebSocket 升级完成
+                                     getUserID(c) → false → return
+                                     Gin Logger → c.Writer.WriteHeader()
+                                     💥 connection hijacked
+  ←── TCP 已断 ──────────────────   浏览器：刚连上就断了 → 1006
+```
+
+**修法**：删掉 upgrade 之后的 `getUserID(c)` 调用——userID 已从 URL 的 token 解析出来了，不需要再读 Gin context：
+
+```go
+conn, _ := upgrader.Upgrade(...)
+// userID 已从 query string 的 token 解析出来，不需要再读 Gin context
+//（Auth 中间件没走——WS 路由在 auth 组外面）
+client := ws.NewClient(hub, conn, userID)  // 直接用上面解析好的 userID
+```
+
+**核心规则**：`upgrader.Upgrade()` 之后，不要再做任何会触发 `c.Writer` 写操作的事。包括：不要 return 非 101 的状态、不要让中间件有机会写响应头。
+
+### 四、问题三：多标签页广播"时有时无"——map 覆盖 bug
+
+**现象**：三个标签页连上，有时 A 发的消息 B 收不到，有时都能收到。广播不稳定。
+
+**根因**：Hub.Clients 是 `map[uint64]*Client`，key 是 userID。三个标签页用同一个 token（同一个 userID），第二个连接覆盖第一个：
+
+```
+标签页A 连接: Clients[1] = clientA     ← A 在 map 里
+标签页B 连接: Clients[1] = clientB     ← B 覆盖了 A！A 的 goroutine 还在跑但 map 里找不到了
+标签页C 连接: Clients[1] = clientC     ← C 覆盖了 B！
+```
+
+Broadcast 遍历 map → 只找到 clientC → 只有最后连的那个标签页收到广播。A 和 B 的 goroutine 在跑但永远收不到消息——它们的 Client 对象还活着（没被 GC），但 map 里没有引用指向它们。
+
+**这就是"时有时无"的原因**——取决于你发的消息时，你是 map 里那个唯一的 Client 还是被覆盖的那个。
+
+**修法**：`map[uint64]*Client` → `map[uint64]map[*Client]bool`。每个 userID 下不再是一个 Client，而是一个 Client 集合（set）：
+
+```go
+// 改前
+Clients map[uint64]*Client
+
+// 改后
+Clients map[uint64]map[*Client]bool  // userID → set of Clients
+// map[*Client]bool 是 Go 里用 map 模拟 set 的惯用写法
+// bool 值忽略，只用来 O(1) 删除
+```
+
+Register 时往集合里加，Unregister 时从集合里删（删完空集合后删 key），Broadcast 时嵌套遍历：
+
+```go
+// Register
+if h.Clients[client.UserID] == nil {
+    h.Clients[client.UserID] = make(map[*Client]bool)
+}
+h.Clients[client.UserID][client] = true
+
+// Unregister
+delete(h.Clients[client.UserID], client)
+if len(h.Clients[client.UserID]) == 0 {
+    delete(h.Clients, client.UserID)
+}
+close(client.Send)
+
+// Broadcast
+for _, set := range h.Clients {
+    for client := range set {
+        select {
+        case client.Send <- msg:
+        default:
+        }
+    }
+}
+```
+
+**为什么用 `map[*Client]bool` 而不是 `[]*Client` slice**：slice 的删除是 O(n)——需要找到元素位置然后截断。set（map）的删除是 O(1)。WS 连接频繁上下线，O(1) 更合适。
+
+### 五、联调成功的完整链路
+
+修复三个问题后，重新测试：
+
+```
+① 浏览器打开 mock.html，粘贴 JWT token，点"连接 WS"
+   → new WebSocket("ws://localhost:7777/v1/ws?token=eyJh...")
+   → 浏览器发 GET /v1/ws?token=eyJh... + Upgrade/Connection 头
+   → Go: r.GET("/v1/ws") 匹配 → WsHandler
+   → c.Query("token") → "eyJh..." → ParseToken → userID=1
+   → upgrader.Upgrade() → 101 Switching Protocols → TCP 升级
+   → NewClient → hub.Register <- client → go ReadPump + WritePump
+
+② 3 个标签页各自连上（userID=1 的 set 里有 3 个 Client）
+   → 标签页A 输入 "hello" 点发送 → ws.send("hello")
+   → 服务器 readPump: ReadMessage → "hello" → hub.Broadcast <- "hello"
+   → Hub.run() broadcast case → 遍历 Clients[1] 的 set → 3 个 client
+   → 每个 client.Send <- "hello" → writePump → WriteMessage → 3 个标签页都收到
+   → ✅ 广播 OK
+
+③ 关掉标签页B
+   → 浏览器发 Close 帧 → readPump ReadMessage 返回 close error
+   → break → defer: hub.Unregister <- clientB
+   → Hub.run() unregister case → delete(set, clientB) → close(clientB.Send)
+   → writePump: range Send 读到关闭 → WriteMessage(CloseMessage) → return
+   → 服务器不 panic
+   → ✅ 断开清理 OK
+
+④ 标签页A 再发消息 → A 和 C 收到，B 收不到（已断开）
+   → ✅ 注销后不再收到广播 OK
+```
+
+### 六、今天踩的坑
+
+1. **WS 路由在 auth 组里 → 浏览器发不出 Authorization header → Auth 中间件拒绝**。修：路由移出 auth 组，WsHandler 自己从 URL 解析 token。
+
+2. **upgrade 后又调 `getUserID(c)` 读 Gin context → Auth 没跑所以 key 不存在 → return → Gin 中间件往已接管连接写响应 → hijacked panic**。修：删掉 upgrade 后的 getUserID 调用，userID 已在前面从 token 解析好了。
+
+3. **`map[uint64]*Client` 同 userID 多连接互相覆盖 → 广播只送到最后连的那个标签页**。修：改为 `map[uint64]map[*Client]bool` 集合，一个 userID 下存所有连接。
+
+4. **main.go 里 `auth.GET("/v1/ws", ...)` 路径双写**：auth 组已经有 `/v1` 前缀，又写了 `/v1/ws` 实际路径变成 `/v1/v1/ws`。修：`r.GET("/v1/ws", ...)` 不经过 auth 组。
+
+5. **60 秒心跳"不触发"**：不是 bug——浏览器标签页开着会自动回 Pong，心跳续上了所以不断。心跳断开只在**真正断网/关标签页**时才触发。测心跳断开的方法是直接关标签页，等几秒看服务器日志的 `client unregistered`。
+
+### 七、commit 记录
+
+```bash
+544d613 fix: W2D4 Hub联调——WS鉴权链路修复 + Clients改为多连接set
+```
+
+四个文件改动：
+- `cmd/server/main.go`：WS 路由从 auth 组移出，改为 `r.GET`
+- `internal/handler/ws_handler.go`：不再依赖 Auth 中间件，从 query string 读 token 自验 JWT；删掉 upgrade 后重复的 `getUserID(c)` 调用
+- `internal/websocket/hub.go`：`Clients` 从 `map[uint64]*Client` 改为 `map[uint64]map[*Client]bool`
+- `mock.html`：新增浏览器联调测试页面
