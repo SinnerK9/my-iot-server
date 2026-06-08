@@ -3,8 +3,10 @@ package handler
 import (
 	"log/slog"
 	"net/http"
+	"strings"
 
 	ws "github.com/SinnerK9/my-iot-server/internal/websocket" //简写ws
+	"github.com/SinnerK9/my-iot-server/pkg/jwtutil"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 )
@@ -22,17 +24,31 @@ var upgrader = websocket.Upgrader{
 // 返回一个Gin Handler，接收Websocket连接
 func WsHandler(hub *ws.Hub) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		//联调需求：Websocket不支持自定义HTTP Header，需要从Query string读token，而非Authorization header
+		token := c.Query("token")
+		if token == "" {
+			auth := c.GetHeader("Authorization")
+			token = strings.TrimPrefix(auth, "Bearer ")
+		}
+
+		var userID uint64
+		if token != "" {
+			claims, err := jwtutil.ParseToken(token)
+			if err != nil {
+				return
+			}
+			userID = claims.UserID
+		} else {
+			userID = 0
+		}
 		conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 		if err != nil {
 			slog.Error("ws upgrade failed", "err", err)
 			return
 		}
-		//从context取Auth中间件注入的UserID
-		userID, ok := getUserID(c)
-		if !ok {
-			conn.Close()
-			return
-		}
+		// userID 已从 query string 的 token 解析出来，不需要再读 Gin context
+		//（Auth 中间件没走——WS 路由在 auth 组外面）
+
 		//创建新client并将其注册到hub
 		client := ws.NewClient(hub, conn, userID)
 		hub.Register <- client
