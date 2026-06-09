@@ -38,6 +38,11 @@ func main() {
 	}
 	defer repository.CloseDB() //延后执行closedb
 
+	if err := repository.InitRedis(cfg.RedisAddr); err != nil {
+		slog.Error("init redis failed", "err", err)
+		os.Exit(1)
+	}
+	defer repository.CloseRedis()
 	// 初始化 JWT——必须在路由注册之前调用，否则 Login 生成 token 时 secret 是 nil
 	jwtutil.Init(cfg.JWTSecret)
 
