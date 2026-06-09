@@ -11,6 +11,7 @@ type Config struct {
 	DBPass    string
 	DBName    string
 	JWTSecret string //新增JWT签名密钥，用于鉴权，该密钥全局共享
+	RedisAddr string //新增Redis地址"host:port"
 }
 
 // 从环境变量读取配置，读不到就用指定的默认值，最后返回配置结构体的指针
@@ -24,6 +25,7 @@ func Load() *Config {
 		DBPass:    getenv("DB_PASS", "123456"),
 		DBName:    getenv("DB_NAME", "iot_gateway"),
 		JWTSecret: getenv("JWT_SECRET", "dev-secret-change-in-production"),
+		RedisAddr: getenv("REDIS_ADDR", "127.0.0.1:6379"),
 	}
 }
 
