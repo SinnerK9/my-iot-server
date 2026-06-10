@@ -3,6 +3,8 @@ package websocket
 import (
 	"log/slog"
 	"sync"
+
+	"github.com/SinnerK9/my-iot-server/internal/repository"
 )
 
 // Hub 管理所有活跃的 WebSocket 连接。
@@ -16,7 +18,7 @@ type Hub struct {
 	Mu sync.RWMutex
 
 	Register   chan *Client
-	Unregister  chan *Client
+	Unregister chan *Client
 	Broadcast  chan []byte
 }
 
@@ -25,7 +27,7 @@ func NewHub() *Hub {
 	return &Hub{
 		Clients:    make(map[uint64]map[*Client]bool),
 		Register:   make(chan *Client),
-		Unregister:  make(chan *Client),
+		Unregister: make(chan *Client),
 		Broadcast:  make(chan []byte),
 	}
 }
@@ -45,24 +47,33 @@ func (h *Hub) run() {
 			if h.Clients[client.UserID] == nil {
 				h.Clients[client.UserID] = make(map[*Client]bool)
 			}
+			//增加判断：加入之前set是不是空的？是则是该用户第一个连接,在redis中设置该用户在线
+			isFirst := len(h.Clients[client.UserID]) == 0
 			h.Clients[client.UserID][client] = true
 			h.Mu.Unlock()
+			if isFirst {
+				h.markUserOnline(client.UserID)
+			}
 			slog.Info("client registered", "userID", client.UserID)
 
 		case client := <-h.Unregister:
 			h.Mu.Lock()
-			if set, ok := h.Clients[client.UserID]; ok {
-				if set[client] {
-					delete(set, client)
-					// 删完如果这个 userID 下没连接了，删掉整个 key
-					if len(set) == 0 {
-						delete(h.Clients, client.UserID)
-					}
-					// close 必须在 delete(map) 之后——广播不会再找到这个 client
-					close(client.Send)
-				}
+			set, ok := h.Clients[client.UserID]
+			if !ok || !set[client] {
+				h.Mu.Unlock()
+				continue //重复unregister直接跳过
+			}
+			delete(set, client)
+			close(client.Send)
+			//删除后set空了，该用户最后一个链接
+			isLast := len(set) == 0
+			if isLast {
+				delete(h.Clients, client.UserID)
 			}
 			h.Mu.Unlock()
+			if isLast {
+				h.markUserOffline(client.UserID)
+			}
 			slog.Info("client unregistered", "userID", client.UserID)
 
 		case msg := <-h.Broadcast:
@@ -92,5 +103,26 @@ func (h *Hub) SendToUser(userID uint64, msg []byte) {
 			default:
 			}
 		}
+	}
+}
+
+// markUserOnline与redis联动，标记用户上线
+func (h *Hub) markUserOnline(userID uint64) {
+	if err := repository.SetUserOnline(userID); err != nil {
+		slog.Error("redis mark online failed", "err", err, "userID", userID)
+	}
+}
+
+// markUserOffline在redis标记用户下线
+func (h *Hub) markUserOffline(userID uint64) {
+	if err := repository.SetUserOffline(userID); err != nil {
+		slog.Error("redis mark offline failed", "err", err, "userID", userID)
+	}
+}
+
+// RefreshUserTTL 刷新 Redis 里该用户的 TTL（心跳时调用）。
+func (h *Hub) RefreshUserTTL(userID uint64) {
+	if err := repository.RefreshUserTTL(userID); err != nil {
+		slog.Error("redis refresh TTL failed", "err", err, "userID", userID)
 	}
 }

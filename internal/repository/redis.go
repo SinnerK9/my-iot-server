@@ -96,3 +96,52 @@ func GetDeviceInfo(deviceID string) (map[string]string, error) {
 	}
 	return result, nil
 }
+
+// 新增用户维度
+const userOnlineTTL = 120 * time.Second
+
+// SetUserOnline 标记用户在线，当第一个WS建立时调用
+func SetUserOnline(userID uint64) error {
+	ctx := context.Background()
+	uid := fmt.Sprintf("%d", userID) //转为字符串
+	key := "user:" + uid
+
+	if err := RDB.HSet(ctx, key, "status", "online").Err(); err != nil {
+		return fmt.Errorf("HSet user:%s: %w", uid, err)
+	}
+	if err := RDB.Expire(ctx, key, userOnlineTTL).Err(); err != nil {
+		return fmt.Errorf("Expire user:%s: %w", uid, err)
+	}
+	if err := RDB.SAdd(ctx, "online_users", uid).Err(); err != nil {
+		return fmt.Errorf("SAdd online_users: %w", uid, err)
+	}
+	return nil
+}
+
+// SetUserOffline 标记用户离线（最后一个 WS 连接断开时调用）。
+func SetUserOffline(userID uint64) error {
+	ctx := context.Background()
+	uid := fmt.Sprintf("%d", userID)
+	key := "user:" + uid
+
+	if err := RDB.Del(ctx, key).Err(); err != nil {
+		return fmt.Errorf("Del user:%s: %w", uid, err)
+	}
+	if err := RDB.SRem(ctx, "online_users", uid).Err(); err != nil {
+		return fmt.Errorf("SRem online_users: %w", uid, err)
+	}
+	return nil
+}
+
+// RefreshUserTTL刷新用户在线ttl
+func RefreshUserTTL(userID uint64) error {
+	ctx := context.Background()
+	key := fmt.Sprintf("user:%d", userID)
+	return RDB.Expire(ctx, key, userOnlineTTL).Err()
+}
+
+// GetOnlineUsers返回所有在线用户uid
+func GetOnlineUsers() ([]string, error) {
+	ctx := context.Background()
+	return RDB.SMembers(ctx, "online_users").Result()
+}

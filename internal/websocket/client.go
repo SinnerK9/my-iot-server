@@ -96,6 +96,7 @@ func (c *Client) WritePump() {
 			}
 		//情况二：定时器到点了，Ping一下保活
 		case <-ticker.C:
+			c.Hub.RefreshUserTTL(c.UserID) //每 54s 刷新一次 Redis TTL
 			c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := c.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return //Ping不出去了，连接已死，退出

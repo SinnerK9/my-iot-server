@@ -67,6 +67,7 @@ func main() {
 		auth.PUT("/devices/:device_id", handler.UpdateDevice)     // 修改设备信息
 		auth.POST("/devices/:device_id/bind", handler.BindDevice) // 绑定设备（事务）
 		auth.DELETE("/devices/:device_id", handler.UnbindDevice)  // 解绑设备
+		auth.GET("/online/users", handler.GetOnlineUsers)
 	}
 	r.GET("/v1/ws", handler.WsHandler(hub)) //联调修改：鉴权不再由auth中间件而由handler执行
 	addr := ":" + cfg.Port
