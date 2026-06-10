@@ -2088,3 +2088,61 @@ for _, set := range h.Clients {
 - `internal/handler/ws_handler.go`：不再依赖 Auth 中间件，从 query string 读 token 自验 JWT；删掉 upgrade 后重复的 `getUserID(c)` 调用
 - `internal/websocket/hub.go`：`Clients` 从 `map[uint64]*Client` 改为 `map[uint64]map[*Client]bool`
 - `mock.html`：新增浏览器联调测试页面
+
+
+---
+
+## W2D5 笔记——Redis 接入：go-redis/v9 + 设备在线状态
+
+### 一、为什么需要 Redis？MySQL 存设备信息不够吗？
+
+MySQL 管持久化——设备属于谁、叫什么名字。但"设备当前在不在线"是**高频变化、短生命周期**的数据——频繁 UPDATE MySQL 代价太大。
+
+| 操作 | MySQL | Redis |
+|---|---|---|
+| 设备上线 | UPDATE → 磁盘 I/O | HSET → 内存，微秒 |
+| 心跳(100台×60s) | 每分钟 100 次磁盘 UPDATE | EXPIRE 只改 TTL |
+| 查在线列表 | SELECT ... WHERE status | SMEMBERS 纯内存 |
+| 断线检测 | 需额外定时任务 | TTL 自动过期 |
+
+**MySQL = 持久，Redis = 临时。** 设备绑定存 MySQL，在线状态存 Redis。
+
+### 二、go-redis 客户端初始化——和 InitDB 同模式
+
+`redis.NewClient(&redis.Options{Addr,PoolSize:10})` → 创建对象（未连接） → `rdb.Ping(ctx)` 验证 → 赋值给包级 `RDB`。
+
+`context.WithTimeout(3s)`：Ping 最多等 3 秒——不能卡启动。`defer cancel()` 防 context 泄漏。
+
+### 三、context vs EXPIRE vs ticker——三个容易混的东西
+
+| 机制 | 作用 | 周期性？ |
+|---|---|---|
+| `context.WithTimeout` | "这个操作最多等 N 秒" | 一次性 |
+| `Redis EXPIRE` | "N 秒后自动删 key"（可刷新） | 一次性但可重置 |
+| `time.NewTicker` | "每隔 N 秒触发一次" | **周期性的** |
+
+`RDB.Expire(ctx, "device:1", 120s)` 里的 ctx 和 120s **完全无关**——ctx 控制"等 Redis 回复最多多久"（go-redis 内部默认 3s 兜底），120s 是发给 Redis 的"这个 key 多久后自动过期"。
+
+### 四、`.Err()` vs `.Result()`
+
+- `.Err()` — 写类命令（HSET/EXPIRE/SADD/DEL）——只关心成功/失败
+- `.Result()` — 读类命令（HGETALL/SMEMBERS）——需要取出实际数据
+
+### 五、`os.Exit(1)` = 直接死，defer 不执行，退出码 1。和 C++ `exit(1)` 同。`os` 包是 Go 调操作系统内核的入口——`os.Getenv`、`os.Stdout`、`os.Interrupt` 都是内核暴露给进程的东西。
+
+### 六、三种 Redis 数据结构选择
+
+```
+Hash device:{id}   — 设备详情（HSET/HGETALL）→ 为什么不用 String JSON：改一个字段无需整读整写
+Set online_devices — 在线集合（SADD/SREM/SMEMBERS）→ 为什么不用 KEYS *：KEYS 阻塞 Redis
+TTL EXPIRE 120s    — 心跳超时自动删除 → 为什么不用定时任务：Redis 内置，零维护
+```
+
+### commit 记录
+
+```bash
+8e1c4bb feat: Redis 接入——go-redis/v9 客户端 + 设备在线状态 Hash/Set/TTL 操作
+153f033 chore: main.go 串联 Redis 初始化与关闭
+```
+
+修复的 bug：InitRedis/SetDeviceOnline 缺 return nil → 编译不过；GetDeviceInfo key 前缀写错 → 永远空 map。
