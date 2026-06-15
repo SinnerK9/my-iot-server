@@ -12,6 +12,9 @@ type Config struct {
 	DBName    string
 	JWTSecret string //新增JWT签名密钥，用于鉴权，该密钥全局共享
 	RedisAddr string //新增Redis地址"host:port"
+	LLMKey string //API密钥
+	LLMURL string //API地址
+	LLMModel string //模型名字
 }
 
 // 从环境变量读取配置，读不到就用指定的默认值，最后返回配置结构体的指针
@@ -26,6 +29,9 @@ func Load() *Config {
 		DBName:    getenv("DB_NAME", "iot_gateway"),
 		JWTSecret: getenv("JWT_SECRET", "dev-secret-change-in-production"),
 		RedisAddr: getenv("REDIS_ADDR", "127.0.0.1:6379"),
+		LLMKey: getenv("LLM_KEY","")
+		LLMURL: getenv("LLM_URL","https://api.deepseek.com"),
+		LLMModel: getenv("LLM_MODEL","deepseek-chat"),
 	}
 }
 
