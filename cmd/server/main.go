@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/SinnerK9/my-iot-server/internal/client"
 	"github.com/SinnerK9/my-iot-server/internal/config"
 	"github.com/SinnerK9/my-iot-server/internal/handler"
 	"github.com/SinnerK9/my-iot-server/internal/middleware"
@@ -49,6 +50,7 @@ func main() {
 	//初始化HUB
 	hub := ws.NewHub()
 	hub.Start()
+	llmClient := client.NewLLMClient(cfg.LLMKey, cfg.LLMURL, cfg.LLMModel) //初始化LLM客户端
 	r := gin.Default()
 	//这部分为公开路由
 	r.GET("/v1/health", handler.Ping)                // 健康检查，复用已有的
@@ -68,6 +70,7 @@ func main() {
 		auth.POST("/devices/:device_id/bind", handler.BindDevice) // 绑定设备（事务）
 		auth.DELETE("/devices/:device_id", handler.UnbindDevice)  // 解绑设备
 		auth.GET("/online/users", handler.GetOnlineUsers)
+		auth.POST("/chat", handler.ChatHandler(llmClient))
 	}
 	r.GET("/v1/ws", handler.WsHandler(hub)) //联调修改：鉴权不再由auth中间件而由handler执行
 	addr := ":" + cfg.Port
