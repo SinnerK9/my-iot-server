@@ -2240,3 +2240,80 @@ Hub 内存（瞬时）  —  WS 连接表（进程重启清空）
 ```bash
 0922ea0 feat: Hub + Redis 联动——用户在线状态 isFirst/isLast 判断 + 心跳 TTL 刷新 + GET /online/users
 ```
+
+---
+
+## Week 3 Day 1 笔记：LLM 非流式客户端
+
+### 一、今天做了什么
+
+新建 `internal/client/llm_client.go`——封装 LLM API 的 HTTP 调用。外加 `ChatHandler` 测试端点。
+
+核心链路：`POST /v1/chat` → ChatHandler → LLMClient.Chat() → HTTP POST → 云端 LLM → JSON 意图。
+
+### 二、为什么单独开 `internal/client/` 文件夹
+
+**决策逻辑**：这段代码操作的是**外部 LLM API**（通过 HTTP），不是 MySQL、不是 Redis、不判断业务规则、不解析 HTTP 请求体。它负责和外部世界通信，隔离外部依赖——换 LLM 提供商只改这一个文件。
+
+和 repository 是镜像关系：
+
+| | repository | client |
+|---|---|---|
+| 连接对象 | `var DB *sqlx.DB` | `LLMClient.http *http.Client` |
+| 初始化 | `InitDB(dsn)` | `NewLLMClient(key, url, model)` |
+| 操作函数 | `GetUserByPhone(phone)` | `Chat(userMessage)` |
+| 返回模式 | `(*model.User, error)` | `(string, error)` |
+| 配置注入 | 启动时 | 启动时 |
+
+### 三、逐行理解 LLMClient.Chat()
+
+**1. 构造 Prompt**：`systemPrompt`（告诉 LLM 你是谁）+ `userPrompt`（用户指令）。用 raw string（反引号）写多行。
+
+**2. 构造请求体**：`llmReq{Model, Messages: []llmMsg{...}}` → `json.Marshal` → `[]byte`。struct 的 `json:"xxx"` tag 控制 JSON key 名（OpenAI 是 snake_case）。
+
+**3. `context.WithTimeout(context.Background(), 10s)`**：10 秒超时。`cancel()` 必须 defer——否则 timer 泄露。和 `http.Client.Timeout` 双重保障。
+
+**4. `http.NewRequestWithContext(ctx, "POST", url, body)`**：ctx 注入到 request——ctx 取消时自动中断 TCP 读写，不需要手动 close(socket)。
+
+**5. `bytes.NewReader(jsonBody)`**：`jsonBody` 是 `[]byte`，但 `http.NewRequestWithContext` 的 body 参数要求 `io.Reader` 接口。`bytes.NewReader` 把字节变成可读流。
+
+**6. `io.Reader` 接口**：只有一个方法 `Read(p []byte) (n int, err error)`。任何类型实现了它就是 Reader。这是 Go 多态的核心——面向接口。
+
+**7. `c.http.Do(httpReq)`**：阻塞发送，等待完整响应。三种结果：200 OK + JSON / 超时 / 非 200。
+
+**8. `io.ReadAll(resp.Body)`**：把响应体（TCP 流）一次读完 → `[]byte`。
+
+**9. `json.Unmarshal(body, &result)`**：JSON → Go struct。传 `&result`（指针）让 Unmarshal 写入。
+
+**10. 降级**：LLM 失败返回 `5001` 错误码 + "大模型服务不可用"——不崩不露技术堆栈。
+
+### 四、标准库方法速查
+
+| 方法 | 输入 | 输出 | 一句话 |
+|---|---|---|---|
+| `json.Marshal(v)` | Go struct | `[]byte` | struct → JSON |
+| `json.Unmarshal(b, &v)` | `[]byte` | 写入 v | JSON → struct |
+| `bytes.NewReader(b)` | `[]byte` | `*bytes.Reader` | 字节变可读流 |
+| `context.Background()` | 无 | `context.Context` | 根 context |
+| `context.WithTimeout(ctx, d)` | context + 时间 | ctx, cancel | 超时 context |
+| `http.NewRequestWithContext(ctx, method, url, body)` | 各种 | `*http.Request` | 构造 HTTP 请求 |
+| `http.Client.Do(req)` | `*http.Request` | `*http.Response` | 发请求 |
+| `io.ReadAll(r)` | `io.Reader` | `[]byte` | 读完流 |
+
+### 五、C++ ↔ Go 对照
+
+| C++ (libcurl) | Go (net/http) |
+|---|---|
+| `curl_easy_init()` | `&http.Client{}` |
+| `curl_easy_setopt(curl, CURLOPT_URL, url)` | `http.NewRequestWithContext(ctx, "POST", url, body)` |
+| `curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L)` | `Client{Timeout: 10s}` + `context.WithTimeout` |
+| `curl_easy_perform(curl)` | `c.http.Do(httpReq)` |
+| `nlohmann::json::parse(response)` | `json.Unmarshal(body, &result)` |
+| `curl_easy_cleanup(curl)` | defer `resp.Body.Close()` |
+
+### 六、commit 记录
+
+```bash
+ce54902 feat: LLM 非流式客户端——net/http POST JSON + context.WithTimeout 10s
+667f584 feat: ChatHandler + main.go 串联 LLM 客户端——POST /v1/chat 接收文本返回意图
+```
