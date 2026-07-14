@@ -29,7 +29,7 @@ func Load() *Config {
 		DBName:    getenv("DB_NAME", "iot_gateway"),
 		JWTSecret: getenv("JWT_SECRET", "dev-secret-change-in-production"),
 		RedisAddr: getenv("REDIS_ADDR", "127.0.0.1:6379"),
-		LLMKey: getenv("LLM_KEY","")
+		LLMKey:   getenv("LLM_KEY", ""),
 		LLMURL: getenv("LLM_URL","https://api.deepseek.com"),
 		LLMModel: getenv("LLM_MODEL","deepseek-chat"),
 	}
