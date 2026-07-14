@@ -71,6 +71,7 @@ func main() {
 		auth.DELETE("/devices/:device_id", handler.UnbindDevice)  // 解绑设备
 		auth.GET("/online/users", handler.GetOnlineUsers)
 		auth.POST("/chat", handler.ChatHandler(llmClient))
+		auth.POST("/chat/stream", handler.ChatStreamHandler(llmClient)) //流式
 	}
 	r.GET("/v1/ws", handler.WsHandler(hub)) //联调修改：鉴权不再由auth中间件而由handler执行
 	addr := ":" + cfg.Port
