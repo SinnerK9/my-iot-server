@@ -2317,3 +2317,123 @@ Hub 内存（瞬时）  —  WS 连接表（进程重启清空）
 ce54902 feat: LLM 非流式客户端——net/http POST JSON + context.WithTimeout 10s
 667f584 feat: ChatHandler + main.go 串联 LLM 客户端——POST /v1/chat 接收文本返回意图
 ```
+
+---
+
+## Week 3 Day 2 笔记：LLM 流式（SSE）+ 降级兜底
+
+### 一、非流式 vs 流式
+
+| | 非流式 Chat | 流式 ChatStream |
+|---|---|---|
+| 请求体 | `Stream: false` | `Stream: true` |
+| 读响应 | `io.ReadAll` 一次读完 | `bufio.Scanner` 逐行读 |
+| 响应结构 | `llmResp` — Message.Content 全文 | `llmStreamChunk` — Delta.Content 增量 |
+| 返回方式 | `return content, nil` | 每个字调一次 `onChunk(delta)` |
+| 用户体验 | 等 3-5 秒出全结果 | 200ms 看到第一个字 |
+
+### 二、SSE 协议格式
+
+```
+data: {"choices":[{"delta":{"content":"打"},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{"content":"开"},"finish_reason":null}]}
+
+...
+
+data: [DONE]
+```
+
+- 每行 `data: <json>`
+- 空行分隔事件
+- `[DONE]` 表示结束
+
+### 三、bufio.Scanner 逐行读取
+
+```go
+scanner := bufio.NewScanner(resp.Body)
+scanner.Buffer(make([]byte, 4096), 64*1024) // 初始4KB，最大64KB
+
+for scanner.Scan() {
+    line := scanner.Text()
+    // 处理这一行...
+}
+```
+
+- `Scan()` 阻塞直到读满一行
+- 不把整个响应读到内存——只缓存当前行
+- C++ 对应：`std::getline(stream, line)` + string_view
+
+### 四、ChatStreamHandler 的两个 goroutine
+
+```
+主 goroutine（handler 函数本身）：
+  - 设 SSE 响应头
+  - 创建 errCh channel
+  - 启动子 goroutine
+  - 阻塞在 <-errCh
+  - 收到结果 → 发 fallback（如果失败）+ done 事件
+
+子 goroutine（go func）：
+  - 调 llm.ChatStream()
+  - LLM 每吐一个字 → onChunk 回调 → c.SSEvent("delta", delta) → c.Writer.Flush()
+  - LLM 结束 → errCh <- err
+```
+
+**为什么不能单 goroutine**：`llm.ChatStream` 会阻塞等 LLM 响应。如果主 goroutine 调它，
+就没办法同时设 SSE 头和处理 `c.SSEvent`。子 goroutine 专门等 LLM，主 goroutine 等子 goroutine 完成，
+两个方向不混淆。
+
+### 五、c.ShouldBindJSON 为什么是"读"操作
+
+Gin 的 `c *gin.Context` 合并了标准库的 `http.ResponseWriter`（写）和 `*http.Request`（读）。
+`c.ShouldBindJSON` 读的是 `c.Request.Body`——是客户端发来的请求体，不是写给客户端的。
+
+### 六、流式特有的处理
+
+1. **`c.Writer.Flush()`**——Gin 内部有 bufio.Writer 缓冲区，不走 Flush 不会立刻发出去
+2. **`delta == ""` 跳过**——最后一个 chunk 的 content 是空串（只有 finish_reason）
+3. **`scanner.Buffer`**——默认 token 上限 64KB，防止长行截断
+4. **`onChunk` 可以返回 error**——调用方可中止流式读取
+
+### 七、降级策略
+
+```go
+if err != nil {
+    c.SSEvent("fallback", "好的，已收到您的指令，正在为您处理。")
+}
+c.SSEvent("done", "")
+```
+
+LLM 失败时：
+- 不发 HTTP 500（那会断开 SSE 连接）
+- 发 fallback 文本给客户端兜底
+- 发 done 标记结束
+
+### 八、chunk JSON 解析为什么用 Warn 不中止
+
+```go
+if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+    slog.Warn("unmarshal stream chunk failed", ...)
+    continue // 跳过坏行，不中止整条流
+}
+```
+
+流式场景下一个 chunk 解析失败不致命——可能是网络抖动导致一行不完整，
+跳过继续读下一行比整个请求重新来更合理。
+
+### 九、C++ ↔ Go 对照（流式）
+
+| C++ (libcurl) | Go (net/http) |
+|---|---|
+| `CURLOPT_WRITEFUNCTION` 回调 | `bufio.Scanner` + `for scanner.Scan()` |
+| 回调里 `std::cout << data << std::flush` | `c.SSEvent("delta", delta)` + `c.Writer.Flush()` |
+| 手写 SSE 格式 `fprintf(fd, "data: %s\n\n", chunk)` | `c.SSEvent` 自动生成标准格式 |
+| 降级用 `try/catch` 发固定文本 | `if err != nil { fallback }` pattern |
+| 循环里 `curl_multi_perform` 非阻塞 | goroutine 阻塞读——Go 的阻塞 goroutine 不占 CPU |
+
+### 十、commit 记录
+
+```bash
+9681f1b docs: W3D1 笔记——LLM 非流式客户端 + net/http vs libcurl 对照 + io.Reader 接口 + context 超时双重保障
+```
