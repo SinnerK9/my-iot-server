@@ -34,3 +34,38 @@ func ChatHandler(llm *client.LLMClient) gin.HandlerFunc {
 		model.OK(c, gin.H{"llm_response": llmText})
 	}
 }
+
+func ChatStreamHandler(llm *client.LLMClient) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req ChatReq
+		if err := c.ShouldBindJSON(&req); err != nil {
+			model.Fail(c, 4001, "参数错误："+err.Error())
+			return
+		}
+
+		c.Header("Content-type", "text/event-stream")
+		c.Header("Cache-Control", "no-cache")
+		c.Header("Connection", "keep-alive")
+
+		errCh := make(chan error, 1)
+
+		go func() {
+			err := llm.ChatStream(req.Message, func(delta string) error {
+				c.SSEvent("delta", delta)
+				c.Writer.Flush()
+				return nil
+			})
+			errCh <- err
+		}()
+
+		err := <-errCh
+
+		if err != nil {
+			slog.Error("llm stream failed", "err", err)
+			c.SSEvent("fallback", "好的，已收到您的指令，正在为您处理。")
+			c.Writer.Flush()
+		}
+		c.SSEvent("done", "")
+		c.Writer.Flush()
+	}
+}
