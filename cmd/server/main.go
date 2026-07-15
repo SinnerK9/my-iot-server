@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -22,14 +24,11 @@ import (
 )
 
 func main() {
-	// 结构化日志:new方法用JSON格式日志处理器创建一个Logger对象
-	// 将这个Logger对象设置为全局默认日志器
-	// 这个日志处理器将JSON输出到标准输出stdout，并且只输出info级别以上的日志
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	})))
 
-	//加载配置 + 初始化数据库
+	// 加载配置 + 初始化数据库
 	cfg := config.Load()
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&parseTime=true&loc=Local",
 		cfg.DBUser, cfg.DBPass, cfg.DBHost, cfg.DBPort, cfg.DBName)
@@ -37,76 +36,92 @@ func main() {
 		slog.Error("init db failed", "err", err)
 		os.Exit(1)
 	}
-	defer repository.CloseDB() //延后执行closedb
+	defer repository.CloseDB()
 
 	if err := repository.InitRedis(cfg.RedisAddr); err != nil {
 		slog.Error("init redis failed", "err", err)
 		os.Exit(1)
 	}
 	defer repository.CloseRedis()
-	// 初始化 JWT——必须在路由注册之前调用，否则 Login 生成 token 时 secret 是 nil
+
 	jwtutil.Init(cfg.JWTSecret)
 
-	//初始化HUB
+	// 初始化 Hub
 	hub := ws.NewHub()
 	hub.Start()
-	llmClient := client.NewLLMClient(cfg.LLMKey, cfg.LLMURL, cfg.LLMModel) //初始化LLM客户端
-	r := gin.Default()
-	//这部分为公开路由
-	r.GET("/v1/health", handler.Ping)                // 健康检查，复用已有的
-	r.POST("/v1/auth/register", handler.Register)    // 注册
-	r.POST("/v1/auth/login", handler.Login)          // 登录
-	r.POST("/v1/auth/refresh", handler.RefreshToken) //刷新token
 
-	//受保护路由
-	auth := r.Group("/v1")      //创立路由组，组里所有路由共享/v1前缀，并且共享use(auth)
-	auth.Use(middleware.Auth()) //Use对前面已经注册的路由不起作用
+	// 初始化 LLM 客户端
+	llmClient := client.NewLLMClient(cfg.LLMKey, cfg.LLMURL, cfg.LLMModel)
+
+	// 初始化 MQTT 客户端
+	mqttClient, err := client.NewMQTTClient(cfg.MQTTBroker, "go-server-"+randomID())
+	if err != nil {
+		slog.Error("init mqtt failed", "err", err)
+		os.Exit(1)
+	}
+	defer mqttClient.Disconnect()
+
+	// 订阅设备状态——回调里更新 Redis + 广播
+	mqttClient.SubscribeDeviceStatus(func(deviceID string, payload []byte) {
+		slog.Info("device status", "deviceID", deviceID, "payload", string(payload))
+	})
+
+	r := gin.Default()
+
+	// 公开路由
+	r.GET("/v1/health", handler.Ping)
+	r.POST("/v1/auth/register", handler.Register)
+	r.POST("/v1/auth/login", handler.Login)
+	r.POST("/v1/auth/refresh", handler.RefreshToken)
+
+	// 受保护路由
+	auth := r.Group("/v1")
+	auth.Use(middleware.Auth())
 	{
 		auth.GET("/users/me", handler.GetProfile)
-		auth.GET("/devices", handler.ListDevices)                 // 查设备列表
-		auth.POST("/devices", handler.CreateDevice)               // 注册新设备
-		auth.GET("/devices/:device_id", handler.GetDevice)        // 查单台设备
-		auth.PUT("/devices/:device_id", handler.UpdateDevice)     // 修改设备信息
-		auth.POST("/devices/:device_id/bind", handler.BindDevice) // 绑定设备（事务）
-		auth.DELETE("/devices/:device_id", handler.UnbindDevice)  // 解绑设备
+		auth.GET("/devices", handler.ListDevices)
+		auth.POST("/devices", handler.CreateDevice)
+		auth.GET("/devices/:device_id", handler.GetDevice)
+		auth.PUT("/devices/:device_id", handler.UpdateDevice)
+		auth.POST("/devices/:device_id/bind", handler.BindDevice)
+		auth.DELETE("/devices/:device_id", handler.UnbindDevice)
 		auth.GET("/online/users", handler.GetOnlineUsers)
 		auth.POST("/chat", handler.ChatHandler(llmClient))
-		auth.POST("/chat/stream", handler.ChatStreamHandler(llmClient)) //流式
+		auth.POST("/chat/stream", handler.ChatStreamHandler(llmClient))
 	}
-	r.GET("/v1/ws", handler.WsHandler(hub)) //联调修改：鉴权不再由auth中间件而由handler执行
+	r.GET("/v1/ws", handler.WsHandler(hub))
+
 	addr := ":" + cfg.Port
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           r,                //Gin实现了Handler接口，直接传给server
-		ReadHeaderTimeout: 10 * time.Second, //十秒超时
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	//开启一个goroutine，防止阻塞的ListenAndServe影响后续关闭代码的执行
 	go func() {
 		slog.Info("Server starting", "addr", addr)
-		//如果不是正常关闭的错误，打印日志并且退出
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("listen failed", "err", err)
 			os.Exit(1)
 		}
 	}()
-	//用signal.NotifyContext来监听ctrl + c和SIGTERM这两个关闭信号
-	//注意必须传入一个context.Background作为根通知器
-	//返回一个context用于等待信号，一个stop函数用于触发停止
-	ctx, stop := signal.NotifyContext(
-		context.Background(),
-		os.Interrupt,
-		syscall.SIGTERM,
-	)
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	<-ctx.Done()                  //在这里阻塞住，等待关闭信号的到来
-	slog.Info("shutting down...") //得到信号了，从这里开始关闭流程
-	//一个新的停止通知器shutdownCtx，超过五秒就不等了，cancel和stop同理
+	<-ctx.Done()
+	slog.Info("shutting down...")
+
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	//执行关闭服务器，并将是否出错存到err里，有错误则打印日志
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		slog.Error("Shutdown error", "err", err)
 	}
 	slog.Info("bye")
+}
+
+// randomID 生成 8 位随机十六进制字符串——确保 MQTT clientID 唯一。
+func randomID() string {
+	b := make([]byte, 4)
+	rand.Read(b)
+	return hex.EncodeToString(b)
 }
