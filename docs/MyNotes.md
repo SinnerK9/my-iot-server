@@ -2432,8 +2432,227 @@ if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 | 降级用 `try/catch` 发固定文本 | `if err != nil { fallback }` pattern |
 | 循环里 `curl_multi_perform` 非阻塞 | goroutine 阻塞读——Go 的阻塞 goroutine 不占 CPU |
 
-### 十、commit 记录
+### 十、commit 记录（W3D2）
 
 ```bash
-9681f1b docs: W3D1 笔记——LLM 非流式客户端 + net/http vs libcurl 对照 + io.Reader 接口 + context 超时双重保障
+ff13e66 docs: W3D2 笔记——SSE 协议 + bufio.Scanner + 双 goroutine 模型 + c.ShouldBindJSON 双向性 + 降级策略 + C++↔Go 流式对照
+c95a3d0 feat: main.go 注册 /v1/chat/stream 路由 + 初始化 LLM 客户端
+dbb56d9 feat: ChatStreamHandler——SSE 流式端点，双 goroutine 推 delta + fallback 降级兜底
+9224a43 feat: ChatStream 流式调用——bufio.Scanner 逐行解析 SSE data: chunk，onChunk 回调推 delta
+68745c5 feat: config 新增 LLMKey/LLMURL/LLMModel 字段，修 struct 字面量缺逗号
+```
+
+---
+
+## W3D3 笔记：MQTT 客户端 + paho.mqtt.golang + 架构决策
+
+### 一、MQTT 在你系统里的角色
+
+```
+Go Server ──PUBLISH shva/device/light-001/cmd "turn_on"──→ EMQX ──转发──→ 灯
+Go Server ←──SUBSCRIBE shva/device/+/status ←── EMQX ←── 灯上报 "online"
+```
+
+HTTP 是"请求-响应"，MQTT 是"发布-订阅"——中间有 Broker（EMQX）做 topic 路由。
+**发布者和订阅者互相不知道对方的存在**——它们只和 Broker 对话。
+
+### 二、Topic 设计——分层命名
+
+```
+shva / device / light-001 / cmd
+ ─┬─    ──┬──    ───┬───    ─┬─
+ 项目    资源    设备ID     动作
+```
+
+| Topic | 方向 | QoS |
+|---|---|---|
+| `shva/device/{id}/cmd` | Go Server → Device | 1 |
+| `shva/device/{id}/status` | Device → Go Server | 1 |
+| `shva/device/{id}/heartbeat` | Device → Go Server | 0 |
+
+通配符 `+`：`shva/device/+/status` 一次订阅覆盖所有设备。
+
+### 三、QoS 三种级别
+
+| QoS | 保证 | 协议交互 | 本项目 |
+|---|---|---|---|
+| 0 | 发完不管，可能丢 | 1 次 PUBLISH | 心跳 |
+| 1 | 至少一次，可能重复 | PUBLISH + PUBACK | 指令、状态 |
+| 2 | 精确一次 | 4 步握手 | 不用 |
+
+不选 QoS 2 的原因：4 步握手延迟高。控制指令重复执行也是幂等的（"再开一次灯"没问题）。
+面试时要能说出"遗嘱机制是生产必备，当前为缩短链路未实现"。
+
+### 四、MQTTClient 封装——我专门问过的问题
+
+**为什么封装一层而不是直接用 `mqtt.Client`？**
+
+paho 的 `mqtt.Client` 是一个 interface，有 20+ 个方法。不封装的话每个调用方都要：
+- 记住 topic 拼接规则（`shva/device/{id}/cmd`）
+- 决定 QoS 级别
+- 手动 `token.Wait()`
+
+封装后调用方只要 `mqttClient.PublishCommand("light-001", payload)`——**藏住了 topic 拼接、QoS 决策、token 等待三件事**。
+
+和 `repository.CreateUser` 封装 `DB.NamedExec("INSERT ...")` 是同一个道理：
+**调用方不应该知道底层用什么 SQL、MQTT topic 怎么拼、QoS 选几级。**
+
+### 五、MQTT 通信流程
+
+```
+初始化：NewMQTTClient → TCP 连 1883 → MQTT CONNECT → EMQX 回 CONNACK
+订阅：  Subscribe("shva/device/+/status") → EMQX 记录这个 client 的订阅表
+下发：  Publish("shva/device/light-001/cmd") → EMQX 转给设备 → 设备回 PUBACK
+接收：  设备 Publish status → EMQX 查表匹配 → 转发给 Go Server → 回调触发
+断开：  Disconnect(250ms) → 给未发完的消息 250ms 缓冲
+```
+
+### 六、token.Wait()——paho 的同步模式
+
+paho 所有操作返回 `mqtt.Token`——异步句柄：
+```go
+token := client.Publish(topic, 1, false, payload)
+token.Wait()       // 阻塞等 Broker ACK
+token.Error()      // 取结果
+```
+不调 `Wait()` 的话 `Error()` 大概率返回 nil（操作还没完成）。
+C++ 里等价：`socket.send()` + 等 ACK 是两步，这里 `Wait()` 合并了。
+
+### 七、C++ ↔ Go 对照（MQTT）
+
+| C++ (ESP32 PubSubClient) | Go (paho.mqtt.golang) |
+|---|---|
+| `client.publish(topic, payload)` | `client.Publish(topic, 1, false, payload)` + `token.Wait()` |
+| `client.subscribe(topic)` + `client.setCallback()` | `client.Subscribe(topic, 1, handler)` |
+| `client.loop()` 在主循环里 | paho 内部自动维护——不需要手动 loop |
+| Broker：自己搭 Mosquitto / EMQX | Docker EMQX（一样） |
+| WiFi 断线手动重连 | `SetAutoReconnect(true)` 自动 |
+
+---
+
+## ⭐ 架构决策专题——"我应该把代码写在哪个文件？"
+
+### 核心只有两问
+
+**Q1：这段代码操作的是什么数据？**
+**Q2：这段代码是给谁调用的？**
+
+### 决策表
+
+| 你操作的数据 | 你做的事 | 写在 | 例子 |
+|---|---|---|---|
+| 数据库表 | 增删改查 SQL | `repository/{表}_repo.go` | `GetUserByPhone` |
+| 多个 repo 组合+判断 | 业务规则 | `service/{业务}_service.go` | `Register` |
+| HTTP 请求体/参数 | 解析+调 service+返回 JSON | `handler/{业务}_handler.go` | `Login` |
+| HTTP 横切关注点 | 鉴权/日志/限流 | `middleware/` | `Auth()` |
+| DB/Redis 连接本身 | 初始化/关闭/连接池 | `repository/db.go` | `InitDB` |
+| struct 定义/tag | 数据定义 | `model/` | `User struct` |
+| 通用工具（JWT/bcrypt） | 纯函数，无业务依赖 | `pkg/` | `jwtutil` |
+| WebSocket 连接 | 连接管理/消息收发 | `websocket/` | Hub、Client |
+| 外部 API（LLM/MQTT） | 封装通信协议 | `client/` | `LLMClient` |
+
+### 三条快速判断规则
+
+**规则 1：看参数类型**
+```go
+func Login(c *gin.Context)              → handler（Gin context）
+func Register(req *model.RegisterReq)   → service（model struct）
+func GetUserByPhone(phone string)       → repository（简单类型+SQL）
+```
+
+**规则 2：看有没有 SQL**
+代码里有 `SELECT/INSERT/UPDATE/DELETE` 或 `DB.Get/DB.Select/DB.NamedExec` → 一定是 repository。
+
+**规则 3：看有没有 c.JSON / c.ShouldBindJSON**
+有这两个 → 一定是 handler。service 层绝对不应该出现 Gin context。
+
+### 新增功能的思考路径（以"修改密码"为例）
+
+```
+1. 改什么数据？→ users.password → repository/user_repo.go
+2. 加什么方法？→ UpdatePassword(userID, hash) error
+3. 谁调它？→ service.ChangePassword（验旧密码+哈希新密码+调repo）
+4. 谁调 service？→ handler.ChangePassword（解析请求+调service+返回JSON）
+5. 路由？→ main.go: auth.PUT("/users/me/password", handler.ChangePassword)
+```
+
+### W3D3 决策复盘：markUserOnline 为什么在 hub.go 不是 redis.go
+
+```
+markUserOnline 操作的是 Redis 数据——但它不做 Redis 操作，只是调 repository
+"什么时机标记在线"——是 WebSocket 连接管理逻辑，不是 Redis CRUD
+如果放 redis.go：repository 就不得不"知道"WebSocket 的存在——越界了
+
+结论：markUserOnline 是 Hub 的方法（决定时机），调 repository.SetUserOnline（执行 Redis）。
+     repository 提供"锤子"，Hub 决定"什么时候抡"。
+```
+
+---
+
+## ⭐ struct 数据流专题——"你定义的一大堆结构体起什么作用？"
+
+### 流式 LLM 的所有 struct 和数据流向
+
+```
+【方向 1：Go → LLM（请求）】
+
+llmReq ──── 打包成 JSON ────→ HTTP Body ──→ LLM API
+  ├── Model:   "deepseek-chat"
+  ├── Stream:  true
+  └── Messages: []llmMsg
+        ├── {Role:"system", Content:"你是一个智能家居助手..."}
+        └── {Role:"user",   Content:"用户指令：打开客厅的灯"}
+
+llmMsg ═ 对话里的一句话——role 分 system/user/assistant 三种身份
+
+
+【方向 2a：LLM → Go（非流式）】
+
+LLM 返回完整 JSON ──→ json.Unmarshal ──→ llmResp
+  └── Choices[0].Message.Content → "{\"action\":\"turn_on\",...}"
+      完整回答一次到达
+
+llmResp ═ "LLM 一次性说完的话"
+
+
+【方向 2b：LLM → Go（流式）】
+
+LLM 逐行返回 ──→ bufio.Scanner 逐行读 ──→ 逐行 json.Unmarshal ──→ llmStreamChunk
+  data: {"choices":[{"delta":{"content":"打"}}]}   → Delta.Content="打"
+  data: {"choices":[{"delta":{"content":"开"}}]}   → Delta.Content="开"
+  data: [DONE]                                      → break
+
+llmStreamChunk ═ "LLM 正在想的一个字"——逐块到达，逐块推给前端
+
+关键区别：llmResp 用的是 .Message.Content（完整回答）
+         llmStreamChunk 用的是 .Delta.Content（增量文字）
+```
+
+### 四个 struct 一句话总结
+
+| struct | 一句话 |
+|---|---|
+| `llmReq` | "我要问什么"——打包好发给 LLM |
+| `llmMsg` | 对话中的一句话——system/user/assistant |
+| `llmResp` | "LLM 一次性回答完了"——完整响应 |
+| `llmStreamChunk` | "LLM 刚想出一个字"——逐块到达 |
+
+### MQTT struct 和数据流
+
+```
+MQTTClient — 只暴露 3 个方法，藏住底层 paho 复杂 interface
+  ├── PublishCommand(deviceID, payload)  → paho.Publish("shva/device/{id}/cmd", QoS1)
+  ├── SubscribeDeviceStatus(callback)    → paho.Subscribe("shva/device/+/status")
+  └── Disconnect()                       → paho.Disconnect(250ms)
+
+封装前：调用方要知道 topic 格式、QoS 选几级、token.Wait 怎么用
+封装后：调用方只知道"发指令"和"听状态"两个动作
+```
+
+---
+
+### W3D3 commit 记录
+
+```bash
+c3aaee7 feat: MQTT 客户端——paho.mqtt.golang 连接 EMQX Broker，PublishCommand 下发指令 + SubscribeDeviceStatus 通配符订阅状态
 ```
