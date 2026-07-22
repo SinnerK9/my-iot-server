@@ -2656,3 +2656,104 @@ MQTTClient — 只暴露 3 个方法，藏住底层 paho 复杂 interface
 ```bash
 c3aaee7 feat: MQTT 客户端——paho.mqtt.golang 连接 EMQX Broker，PublishCommand 下发指令 + SubscribeDeviceStatus 通配符订阅状态
 ```
+
+---
+
+## Week 3 Day 4：链路串联——WS → LLM → MQTT → Redis → Hub
+
+### 架构决策 1：为什么用 `Hub.OnMessage` 回调而不是让 ReadPump 直接调 orchestrator？
+
+ReadPump 在 `websocket` 包里，Orchestrator 在 `service` 包里。如果 ReadPump 直接 `import service` 然后调 `orchestrator.HandleMessage()`：
+
+```
+websocket → service → (client + repository)
+              ↑
+         循环的起点
+```
+
+但 `service` 包要 `import websocket`（因为 Orchestrator 持有 `*ws.Hub`）→ 循环依赖，Go 编译器直接拒绝。
+
+**解决方案：依赖反转（Dependency Inversion）**
+
+```
+websocket 包声明：type Hub struct { OnMessage func(uint64, []byte) }
+main.go 注入：hub.OnMessage = orchestrator.HandleMessage
+```
+
+websocket 不知道 OnMessage 是谁、做什么——它只知道"有人注册了一个回调，收到消息就调它"。这是 Go 里替代 interface 的轻量方式——**函数指针注入**。
+
+对应 C++：`std::function<void(uint64_t, std::string)> on_message_`。和 Go 的区别是 Go 不需要 `std::bind` 或 lambda 包装——方法值 `orchestrator.HandleMessage` 天然满足函数类型。
+
+### 架构决策 2：`ChatOrchestrator` 为什么放 service 层而不是 handler 层？
+
+handler 层的职责是"一次 HTTP 请求 → 一次响应"。但 WebSocket 消息是**持续的异步流**：
+- 一条消息进来 → 调 LLM（可能 3-5 秒）
+- LLM 返回 → 调 MQTT（异步，不等待设备回复）
+- 设备回报 → MQTT 回调触发（可能 0.5 秒后，也可能 30 秒后）
+- 回调里 → 更新 Redis → Hub 广播
+
+这不是"请求-响应"模型，handler 层装不下这种异步链路。service 层的方法签名字 `HandleMessage(userID uint64, payload []byte)` 不依赖 Gin Context——将来如果消息入口是 CLI、MQTT 主动上报、定时任务，同一个 orchestrator 直接复用。
+
+### 架构决策 3：`llmResp` 和 `llmStreamChunk` 为什么是两个 struct 而不是合并？
+
+它们对应的 LLM API 返回字段路径不同：
+
+```
+非流式：choices[0].message.content  — 完整回答
+流式：  choices[0].delta.content    — 增量文字
+```
+
+如果合并成一个 struct 同时有 `Message` 和 `Delta`——每次 `json.Unmarshal` 只有一个字段有值。代码里要到处判断 `if msg != nil { ... } else { ... }`——这是不必要的复杂度。
+
+两个独立 struct 让意图清晰：**用哪个 struct 取决于调用模式**。重复的 struct 定义不是坏味道——把不同概念强行合并才是。
+
+### 架构决策 4：MQTT 设备状态回调里为什么直接调 Redis + Hub，不经过 Orchestrator？
+
+设备状态上报的方向和用户指令是**相反的**：
+
+```
+用户指令：  WebSocket → Orchestrator → LLM → MQTT → 设备
+设备状态：  设备 → MQTT → 回调 → Redis + Hub → 用户
+```
+
+Orchestrator 处理的是"用户想做什么"。设备状态是"设备发生了什么"——这是被动事件，不需要 LLM 参与，直接更新 Redis + 推送给用户就够了。两者方向不同，不该混进同一个类。
+
+### 数据流全景（W3D4 完成）
+
+```
+浏览器 (mock.html)
+    │ WebSocket text: "打开客厅的灯"
+    ▼
+ReadPump (goroutine)
+    │ c.Hub.OnMessage(c.UserID, msg)
+    ▼
+ChatOrchestrator.HandleMessage(userID, payload)
+    │
+    ├─→ LLM.Chat("打开客厅的灯")
+    │       │ HTTP POST /v1/chat/completions
+    │       ▼ 云端 LLM API
+    │       │ 200 OK SSE 流 或 非流式 JSON
+    │       ▼ "{\"action\":\"turn_on\",\"target\":\"light\",\"params\":{...}}"
+    │
+    ├─→ json.Unmarshal → Intent struct
+    │
+    ├─→ MQTT.PublishCommand(deviceID, cmdBytes)
+    │       │ PUBLISH shva/device/light-001/cmd QoS1
+    │       ▼ EMQX Broker
+    │       │ 转发给订阅者
+    │       ▼ 设备执行 → 状态上报
+    │       │ PUBLISH shva/device/light-001/status
+    │       ▼ MQTT 回调: SubscribeDeviceStatus
+    │         ├─→ Redis.SetDeviceOnline(deviceID, info)
+    │         └─→ Hub.Broadcast ← status JSON
+    │
+    └─→ Hub.Broadcast ← result JSON
+            │
+            ▼ WritePump → 浏览器收到推送
+```
+
+### W3D4 commit 记录
+
+```bash
+29f08f3 feat: W3D4 链路串联——ChatOrchestrator 编排 WS→LLM→MQTT→Redis→Hub，Hub.OnMessage 回调注入
+```
