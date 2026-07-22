@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -18,6 +19,7 @@ import (
 	"github.com/SinnerK9/my-iot-server/internal/handler"
 	"github.com/SinnerK9/my-iot-server/internal/middleware"
 	"github.com/SinnerK9/my-iot-server/internal/repository"
+	"github.com/SinnerK9/my-iot-server/internal/service"
 	ws "github.com/SinnerK9/my-iot-server/internal/websocket"
 	"github.com/SinnerK9/my-iot-server/pkg/jwtutil"
 	"github.com/gin-gonic/gin"
@@ -61,10 +63,26 @@ func main() {
 	}
 	defer mqttClient.Disconnect()
 
-	// 订阅设备状态——回调里更新 Redis + 广播
+	// 订阅设备状态——回调里更新 Redis + Hub 广播
 	mqttClient.SubscribeDeviceStatus(func(deviceID string, payload []byte) {
 		slog.Info("device status", "deviceID", deviceID, "payload", string(payload))
+
+		info := map[string]interface{}{"status": "online"}
+		var status map[string]interface{}
+		if json.Unmarshal(payload, &status) == nil {
+			for k, v := range status {
+				info[k] = v
+			}
+		}
+		repository.SetDeviceOnline(deviceID, info)
+
+		msg := fmt.Sprintf(`{"type":"device_status","device_id":"%s","data":%s}`, deviceID, string(payload))
+		hub.Broadcast <- []byte(msg)
 	})
+
+	// 注入编排器——WebSocket 消息 → LLM → MQTT → Hub 广播
+	orchestrator := service.NewChatOrchestrator(llmClient, mqttClient, hub)
+	hub.OnMessage = orchestrator.HandleMessage
 
 	r := gin.Default()
 

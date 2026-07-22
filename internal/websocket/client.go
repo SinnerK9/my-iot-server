@@ -64,7 +64,10 @@ func (c *Client) ReadPump() {
 			}
 			break //不论是不是设置的错误，都退出循环并执行defer里的收尾逻辑
 		}
-		c.Hub.Broadcast <- msg //收到消息后广播给所有在线客户端
+		//修改：不再直接广播，交由外部编排逻辑
+		if c.Hub.OnMessage != nil {
+			c.Hub.OnMessage(c.UserID, msg)
+		}
 	}
 }
 

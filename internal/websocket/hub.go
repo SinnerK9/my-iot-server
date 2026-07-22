@@ -13,13 +13,12 @@ type Hub struct {
 	// Clients：userID → 该用户的所有连接（一个 set）。
 	// 同一个 userID 可以有多个 Client（多标签页、多设备）。
 	// map[*Client]bool 是 Go 里用 map 模拟 set 的惯用写法——bool 值忽略，只用来 O(1) 删。
-	Clients map[uint64]map[*Client]bool
-
-	Mu sync.RWMutex
-
+	Clients    map[uint64]map[*Client]bool
+	Mu         sync.RWMutex
 	Register   chan *Client
 	Unregister chan *Client
 	Broadcast  chan []byte
+	OnMessage  func(userID uint64, payload []byte) //外部注入的消息处理函数
 }
 
 // NewHub 创建并返回 Hub 实例。
