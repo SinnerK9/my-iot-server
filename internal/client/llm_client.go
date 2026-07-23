@@ -64,6 +64,13 @@ func NewLLMClient(apiKey, baseURL, model string) *LLMClient {
 
 // Chat 非流式调用 LLM——一次性返回完整结果。
 func (c *LLMClient) Chat(userMessage string) (string, error) {
+	// 没有配置 API Key → 降级为关键词匹配（开发/演示用）
+	if c.apiKey == "" {
+		slog.Warn("llm api key empty, using fallback keyword match")
+		time.Sleep(200 * time.Millisecond) // 模拟网络延迟
+		return fallbackIntent(userMessage), nil
+	}
+
 	systemPrompt := buildSystemPrompt()
 	userPrompt := fmt.Sprintf("用户指令：%s", userMessage)
 
@@ -213,4 +220,60 @@ func buildSystemPrompt() string {
 
 返回格式（不要加任何额外文字）：
 {"action":"操作","target":"设备类型","params":{"device_id":"如果用户指定了具体设备名或房间则填，否则填null","room":"房间名或null","value":数字或null}}`
+}
+
+// fallbackIntent 无 API Key 时的关键词降级匹配。
+// 开发阶段不依赖外部 LLM，简单关键词匹配即可验证全链路。
+func fallbackIntent(text string) string {
+	action := "unknown"
+	target := "unknown"
+	room := "null"
+
+	// 动作匹配
+	switch {
+	case strings.Contains(text, "开灯") || strings.Contains(text, "打开灯") ||
+		(strings.Contains(text, "开") && strings.Contains(text, "灯")):
+		action = "turn_on"
+		target = "light"
+	case strings.Contains(text, "关灯") || strings.Contains(text, "关闭灯") ||
+		(strings.Contains(text, "关") && strings.Contains(text, "灯")):
+		action = "turn_off"
+		target = "light"
+	case strings.Contains(text, "开空调") || strings.Contains(text, "打开空调"):
+		action = "turn_on"
+		target = "aircon"
+	case strings.Contains(text, "关空调") || strings.Contains(text, "关闭空调"):
+		action = "turn_off"
+		target = "aircon"
+	case strings.Contains(text, "开窗帘") || strings.Contains(text, "打开窗帘"):
+		action = "open"
+		target = "curtain"
+	case strings.Contains(text, "关窗帘") || strings.Contains(text, "关闭窗帘") || strings.Contains(text, "拉上窗帘"):
+		action = "close"
+		target = "curtain"
+	case strings.Contains(text, "温度") || strings.Contains(text, "度"):
+		action = "set_temp"
+		target = "aircon"
+	case strings.Contains(text, "打开") || strings.Contains(text, "开"):
+		action = "turn_on"
+		target = "light"
+	case strings.Contains(text, "关闭") || strings.Contains(text, "关"):
+		action = "turn_off"
+		target = "light"
+	}
+
+	// 房间匹配
+	switch {
+	case strings.Contains(text, "客厅"):
+		room = `"客厅"`
+	case strings.Contains(text, "卧室"):
+		room = `"卧室"`
+	case strings.Contains(text, "厨房"):
+		room = `"厨房"`
+	}
+
+	return fmt.Sprintf(
+		`{"action":"%s","target":"%s","params":{"device_id":null,"room":%s,"value":null}}`,
+		action, target, room,
+	)
 }
