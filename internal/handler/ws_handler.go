@@ -21,6 +21,7 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
+//补全Upgrade逻辑
 // 返回一个Gin Handler，接收Websocket连接
 func WsHandler(hub *ws.Hub) gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -30,17 +31,18 @@ func WsHandler(hub *ws.Hub) gin.HandlerFunc {
 			auth := c.GetHeader("Authorization")
 			token = strings.TrimPrefix(auth, "Bearer ")
 		}
-
-		var userID uint64
-		if token != "" {
-			claims, err := jwtutil.ParseToken(token)
-			if err != nil {
-				return
-			}
-			userID = claims.UserID
-		} else {
-			userID = 0
+		//没有token直接拒绝http升级
+		if token == "" {
+			c.JSON(http.StatusUnauthorized,gin.H{"code": 4010,"msg":"缺少认证 token"})
+			return
 		}
+		//解析jwt，失败则拒绝
+		claims ,err := jwtutil.ParseToken(token)
+		if err != nil{
+			c.JSON(http.StatusUnauthorized,gin.H{"code":4011,"msg":"Token 过期或无效"})
+			return
+		}
+		//鉴权完全通过才从http升级到websocket
 		conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 		if err != nil {
 			slog.Error("ws upgrade failed", "err", err)
@@ -50,12 +52,12 @@ func WsHandler(hub *ws.Hub) gin.HandlerFunc {
 		//（Auth 中间件没走——WS 路由在 auth 组外面）
 
 		//创建新client并将其注册到hub
-		client := ws.NewClient(hub, conn, userID)
+		client := ws.NewClient(hub, conn, claims.UserID)
 		hub.Register <- client
 		//Register后启动读写协程
 		//两个goroutine都是阻塞的，readpump在Readmessage上，writePump在select上
 		go client.ReadPump()
 		go client.WritePump()
-		slog.Info("ws connected", "userID", userID)
+		slog.Info("ws connected", "userID", claims.UserID)
 	}
 }

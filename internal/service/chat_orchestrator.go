@@ -8,7 +8,7 @@ import (
 	ws "github.com/SinnerK9/my-iot-server/internal/websocket"
 )
 
-// Intent LLM 返回的意图 JSON 结构
+// Intent LLM 返回的意图 JSON 结构 如{"action":"turn_on","target":"light","params":{"room":"客厅"}}
 type Intent struct {
 	Action string                 `json:"action"`
 	Target string                 `json:"target"`

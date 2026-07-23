@@ -21,7 +21,7 @@ func NewMQTTClient(brokerURL, clientID string) (*MQTTClient, error) {
 	opts.AddBroker(brokerURL)
 	opts.SetClientID(clientID) //客户端id在broker下不能重复
 	opts.SetAutoReconnect(true)
-	opts.SetMaxReconnectDelay(10 * time.Second)
+	opts.SetConnectRetryInterval(10 * time.Second)
 	c := mqtt.NewClient(opts)
 	token := c.Connect()
 	// token.Wait() 阻塞直到连接完成
