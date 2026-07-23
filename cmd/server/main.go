@@ -88,6 +88,7 @@ func main() {
 
 	// 公开路由
 	r.GET("/v1/health", handler.Ping)
+	r.GET("/v1/health/deps", handler.HealthCheck) // 依赖健康检查：DB + Redis
 	r.POST("/v1/auth/register", handler.Register)
 	r.POST("/v1/auth/login", handler.Login)
 	r.POST("/v1/auth/refresh", handler.RefreshToken)

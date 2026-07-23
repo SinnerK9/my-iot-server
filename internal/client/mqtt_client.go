@@ -19,24 +19,41 @@ type MQTTClient struct {
 func NewMQTTClient(brokerURL, clientID string) (*MQTTClient, error) {
 	opts := mqtt.NewClientOptions()
 	opts.AddBroker(brokerURL)
-	opts.SetClientID(clientID) //客户端id在broker下不能重复
+	opts.SetClientID(clientID) // 客户端 ID 在 broker 下不能重复
 	opts.SetAutoReconnect(true)
-	opts.SetConnectRetryInterval(10 * time.Second)
+	opts.SetMaxReconnectDelay(10 * time.Second)
+
+	// Day 6：监听连接状态变化
+	opts.OnConnectionLost = func(_ mqtt.Client, err error) {
+		slog.Warn("mqtt connection lost", "err", err)
+	}
+	opts.OnConnect = func(_ mqtt.Client) {
+		slog.Info("mqtt reconnected")
+	}
+
 	c := mqtt.NewClient(opts)
 	token := c.Connect()
 	// token.Wait() 阻塞直到连接完成
 	if token.Wait() && token.Error() != nil {
 		return nil, fmt.Errorf("mqtt connect: %w", token.Error())
 	}
+
 	slog.Info("mqtt connected", "broker", brokerURL)
 	return &MQTTClient{client: c}, nil
 }
 
+// IsConnected 返回 MQTT 是否处于连接状态。
+// 调用方在发指令前检查——如果断了，给用户即时反馈。
+func (m *MQTTClient) IsConnected() bool {
+	return m.client.IsConnected()
+}
+
+// PublishCommand 向指定设备下发控制指令。
+// topic：shva/device/{deviceID}/cmd，QoS 1
 func (m *MQTTClient) PublishCommand(deviceID string, payload []byte) error {
-	topic := fmt.Sprintf("shva/device/%s/cmd", deviceID) //拼接MQTT消息主题，格式为 shva/device/{设备ID}/cmd
-	token := m.client.Publish(topic, 1, false, payload)  //返回一个异步操作句柄，Publish本身异步非阻塞，Token的作用是等待后续操作完成获取结果
-	//publish设置QoS1，至少会送达一次，必须受到broker返回的ACK包才不再发送
-	token.Wait() //没有wait，协程会一直运行，在执行完毕之前err大概率一直是nil，会导致误读
+	topic := fmt.Sprintf("shva/device/%s/cmd", deviceID)
+	token := m.client.Publish(topic, 1, false, payload)
+	token.Wait() // 阻塞等 Broker ACK
 	if err := token.Error(); err != nil {
 		return fmt.Errorf("publish to %s: %w", topic, err)
 	}
@@ -45,13 +62,11 @@ func (m *MQTTClient) PublishCommand(deviceID string, payload []byte) error {
 }
 
 // SubscribeDeviceStatus 订阅所有设备的状态上报。
+// topic 通配符 + 匹配任意一个设备 ID，一次性覆盖所有设备。
 func (m *MQTTClient) SubscribeDeviceStatus(onStatus func(deviceID string, payload []byte)) {
-	topic := "shva/device/+/status" //+为通配符，匹配任意一个设备id，一次性订阅所有设备的状态主题
-	//定义一个回调匿名函数，当设备上报状态时调用
+	topic := "shva/device/+/status"
 	token := m.client.Subscribe(topic, 1, func(_ mqtt.Client, msg mqtt.Message) {
-		// 从 topic 中提取设备 ID
 		deviceID := extractDeviceID(msg.Topic())
-		//onstatus应为上层业务函数
 		onStatus(deviceID, msg.Payload())
 	})
 	token.Wait()
@@ -69,6 +84,7 @@ func (m *MQTTClient) Disconnect() {
 }
 
 // extractDeviceID 从 MQTT topic 中提取设备 ID。
+// "shva/device/light-001/status" → "light-001"
 func extractDeviceID(topic string) string {
 	parts := strings.Split(topic, "/")
 	if len(parts) >= 3 {
