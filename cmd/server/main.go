@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	_ "net/http/pprof" // 空导入注册 /debug/pprof 路由，零侵入
 	"os"
 	"os/signal"
 	"syscall"
@@ -84,8 +85,14 @@ func main() {
 	orchestrator := service.NewChatOrchestrator(llmClient, mqttClient, hub)
 	hub.OnMessage = orchestrator.HandleMessage
 
+	// pprof 性能分析——独立端口，不与业务 API 混用
+	go func() {
+		slog.Info("pprof starting", "addr", ":6060")
+		http.ListenAndServe(":6060", nil) // pprof 注册在默认 DefaultServeMux 上
+	}()
+
 	r := gin.Default()
-	r.Use(middleware.CORS()) // CORS——开发阶段必备，否则浏览器拦截跨域请求
+	r.Use(middleware.CORS())
 
 	// 公开路由
 	r.GET("/v1/health", handler.Ping)
