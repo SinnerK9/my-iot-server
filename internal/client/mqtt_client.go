@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
@@ -20,8 +19,7 @@ func NewMQTTClient(brokerURL, clientID string) (*MQTTClient, error) {
 	opts := mqtt.NewClientOptions()
 	opts.AddBroker(brokerURL)
 	opts.SetClientID(clientID) // 客户端 ID 在 broker 下不能重复
-	opts.SetAutoReconnect(true)
-	opts.SetMaxReconnectDelay(10 * time.Second)
+	opts.SetAutoReconnect(true) // 断线自动重连，库自带默认间隔
 
 	// Day 6：监听连接状态变化
 	opts.OnConnectionLost = func(_ mqtt.Client, err error) {
