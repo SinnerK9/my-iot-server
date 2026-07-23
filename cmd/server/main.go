@@ -85,6 +85,7 @@ func main() {
 	hub.OnMessage = orchestrator.HandleMessage
 
 	r := gin.Default()
+	r.Use(middleware.CORS()) // CORS——开发阶段必备，否则浏览器拦截跨域请求
 
 	// 公开路由
 	r.GET("/v1/health", handler.Ping)
